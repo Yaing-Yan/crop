@@ -113,10 +113,12 @@ class TestRgcc(unittest.TestCase):
         code = cu.code
         self.assertEqual(code[:2], bytes.fromhex("1EFC"))            # POP ER12
         self.assertEqual(code[4:6], bytes.fromhex("30D7"))            # L R7,-10h[BP]
-        self.assertEqual(code[6:8], bytes.fromhex("1EFC"))            # POP ER12（切到目的变量）
-        self.assertEqual(code[10:12], bytes.fromhex("B0D7"))          # ST R7,-10h[BP]
+        self.assertEqual(code[6:8], self.be.noop_ins)                 # 空操作间隔（真机需要）
+        self.assertEqual(code[8:10], bytes.fromhex("1EFC"))           # POP ER12（切到目的变量）
+        self.assertEqual(code[12:14], bytes.fromhex("B0D7"))          # ST R7,-10h[BP]
+        self.assertEqual(code[14:16], self.be.noop_ins)               # 尾部间隔
         self.assertEqual((code[2] | (code[3] << 8)), 0xEA41 + 0x10)   # 源 y 的基址
-        self.assertEqual((code[8] | (code[9] << 8)), 0xEA40 + 0x10)   # 目的 x 的基址
+        self.assertEqual((code[10] | (code[11] << 8)), 0xEA40 + 0x10)  # 目的 x 的基址
         res = translate(self.db, cu.code, Options())
         self.assertEqual(res.stats["unsupported"], 0, res.dsl)
 

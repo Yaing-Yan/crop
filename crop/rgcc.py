@@ -93,6 +93,8 @@ class Backend:
     pop_gad: Dict[str, Tuple[int, bytes]] = field(default_factory=dict)
     #: 变量装载槽：寄存器名 → (偏移, ``L Rn, off[base]`` 的字节)。基址由 ``base_pop`` 装载。
     var_load: Dict[str, Tuple[int, bytes]] = field(default_factory=dict)
+    #: 空操作间隔（``MOV Rn, Rn``，无副作用、以 POP PC 结尾）：用来把相邻的搬运动作隔开
+    noop_ins: bytes = b""
 
     def __post_init__(self) -> None:
         self._derive()
@@ -192,6 +194,13 @@ class Backend:
             if got:
                 self.pop_gad[reg] = (got[0], got[1])
 
+        # ---- 空操作 gadget（间隔用）：MOV Rn, Rn ----
+        for cand in ("MOV R7, R7", "MOV R1, R1", "MOV R0, R0", "MOV R8, R8"):
+            got = self._single(cand)
+            if got:
+                self.noop_ins = got[1]
+                break
+
         # ---- 变量装载槽（变量 → 指定寄存器），基址与变量槽同一套（BP/FP）----
         pat = re.compile(r"^([A-Z0-9]+), (-?[0-9A-F]+h)\[%s\]$" % re.escape(self.slot_base))
         for addr in sorted(self.db.by_addr):
@@ -244,8 +253,11 @@ class Backend:
             b = (a - off) & 0xFFFF
             return bytes([b & 0xFF, (b >> 8) & 0xFF])
 
-        return (self.base_pop + base(src_addr) + self.slot_load
-                + self.base_pop + base(dst_addr) + self.slot_store)
+        # 两次搬运动作之间插一条空操作 gadget：真机实测"copy 紧跟 copy"时第一次会失效
+        # （copytest 里 copy 后面跟常量写则没事），插开一格可规避。
+        gap = self.noop_ins
+        return (self.base_pop + base(src_addr) + self.slot_load + gap
+                + self.base_pop + base(dst_addr) + self.slot_store + gap)
 
     def describe(self) -> str:
         return ("常量写内存: POP→%s + ST @%05X（内联 %d 字节）；"
