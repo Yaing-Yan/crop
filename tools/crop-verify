@@ -169,6 +169,8 @@ def main() -> int:
         return 0
 
     print("\n--- 注入 ---")
+    print("先按 AC 清输入行/复位 OS 的输入状态（顺序很重要：写内存之后再按 AC 会被 OS 覆盖）")
+    tap(KEY_AC, **kw)
     rpc("write_memory", {"address": conf.left_addr, "bytes": list(chain)}, **kw)
     zeros = bytes(0x40)
     rpc("write_memory", {"address": 0xD180, "bytes": list(zeros)}, **kw)
@@ -179,8 +181,7 @@ def main() -> int:
     back = read_mem(conf.left_addr, len(chain), **kw)
     print("链回读%s" % ("一致 ✓" if back == chain else "不一致 ✗"))
 
-    print("--- 按键：AC → [→] → [=]（长按 %.1fs）---" % HOLD_S)
-    tap(KEY_AC, **kw)
+    print("--- 按键：[→] → [=]（长按 %.1fs）---" % HOLD_S)
     tap(KEY_RIGHT, **kw)
     tap(KEY_EQ, **kw)
 

@@ -4,7 +4,8 @@
  *              examples/rstring.c -o out/rstring.bin --asm \
  *              --rop out/rstring-Rop.bin
  *
- * 做的事：把 "CROP" 搬进 msg、填 4 个空格、写一个 16 位值，然后打印并刷新。
+ * 做的事：清零 msg → 搬 "CROP" 进去 → 覆写前两字节为 'A','B' → 打印并刷新。
+ * 期望：msg = 41 42 4F 50 00 00 00 00（lo=65, hi=66），屏幕上出现 "ABOP"。
  */
 #include "rstdio.h"
 #include "rstring.h"
@@ -15,10 +16,9 @@ unsigned char hi;
 unsigned char lo;
 
 void main(void) {
-    rcopy4(msg, "CROP");
-    rfill4(msg, 32);              /* 后四个字节填成空格（rfill 的 4 展开） */
-    rcopy4(msg, "CROP");          /* 再把前四个写回，演示两次搬运 */
-    rput16(msg, 65, 66);          /* msg[0..1] = 'A','B' */
+    rfill8(msg, 0);               /* 先清零：字符串要有 0 结尾 */
+    rcopy4(msg, "CROP");          /* 前四个字节 ← "CROP" */
+    rput16(msg, 65, 66);          /* msg[0..1] = 'A','B' ⇒ 屏幕上打成 "ABOP" */
     lo = msg[0];
     hi = msg[1];
     rclear();
