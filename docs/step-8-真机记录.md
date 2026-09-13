@@ -20,7 +20,21 @@ cd <EMU_DIR> && ./CasioEmuMsvc models/<VERF_MODEL_DIR>
 同一份源码换 `--rom-dir` 编 VerC（标签自动解析到 `0x221B2/0x08706/0x07F00`，rt-fix `0x2B948`），
 在 VerC 机型上同样读到渲染出的文字与显存副本。
 
-## 2. `examples/rstring.c` —— 离线已确证语义；真机**仍未复现**（round 3–4）
+## 1'. `examples/copytest.c` —— ✅ 通过（round 11，手按按键）
+
+```
+注入：链 54 字节 @0xEC00、launcher @0xD248、账本 0xD244=07；D700..D702 清零
+手按 [→] [=] 后：D700=07  D701=07  D702=09        ✅ 与 C 语义一致
+```
+
+这一条同时确证了三件事：
+
+1. **按键必须人按**（MCP `keyboard_code` 这台机器上不生效；详见 `docs/注入规程.md`）；
+2. **`copy_var`（BP 槽 `POP ER12 + L/ST R7,-10h[BP]`）在真机上成立** —— 这是本项目最容易
+   出错的一环，`b = a` 读回 7 就是它的直接证据；
+3. 变量区 `0xD700` 在这台机器上可用（先前"写不进去"的结论是**没触发**造成的假象）。
+
+## 2. `examples/rstring.c` —— 离线已确证语义；真机记录待手按补齐
 
 **离线（真 ROM 的 lifted 模拟器）跑这条 428 字节链，结果完全正确：**
 
