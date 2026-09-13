@@ -266,34 +266,88 @@ class Backend:
 
 
 # ----------------------------------------------------------------- 前端
+U8 = "u8"
+
+
 @dataclass
-class Var:
+class Sym:
+    """一个内存对象：变量 / 数组 / 结构体变量 / 指针。"""
+
     name: str
     addr: int
+    kind: str = "byte"                  # 'byte' | 'array' | 'struct' | 'ptr'
+    size: int = 1                       # 占多少字节
+    elem: str = U8                      # 数组元素类型（'u8' 或 'struct:名字'）
+    count: int = 1                      # 数组长度
+    fields: Dict[str, int] = field(default_factory=dict)   # 结构体字段 → 字节偏移
+
+    def describe(self) -> str:
+        if self.kind == "array":
+            return "%s[%d]@%04X" % (self.name, self.count, self.addr)
+        if self.kind == "ptr":
+            return "*%s@%04X" % (self.name, self.addr)
+        return "%s@%04X" % (self.name, self.addr)
+
+
+#: 兼容旧名字（外部脚本/测试里用过 ``Var``）
+Var = Sym
+
+
+@dataclass
+class MemRef:
+    """一个内存位置（左值/右值）。
+
+    目前恒为**常量地址**；A4 会把 ``kind='var'`` 用起来（地址存在某个变量里）。
+    """
+
+    kind: str = "const"                 # 'const'（地址已知）| 'ptrparam'（指向编译期已知地址的形参）
+    value: int = 0                      # const：绝对地址
+    var: str = ""                       # ptrparam：形参名
+    offset: int = 0
+    note: str = ""
+
+    def label(self) -> str:
+        if self.kind == "const":
+            return "[%04X]" % self.value
+        return "[*%s+%d]" % (self.var, self.offset)
 
 
 @dataclass
 class Stmt:
-    kind: str                  # 'assign' | 'copy' | 'loop' | 'call'
-    var: Optional[str] = None
+    kind: str = "assign"                # 'assign' | 'copy' | 'loop' | 'call' | 'return'
+    dst: Optional[MemRef] = None
     value: int = 0
+    src: Optional[MemRef] = None
     body: List["Stmt"] = field(default_factory=list)
     line: int = 0
-    src: str = ""                      # kind == 'copy' 时的源变量
-    name: str = ""                     # kind == 'call' 时的函数名
+    name: str = ""                      # kind == 'call'
     args: List[Tuple[str, object]] = field(default_factory=list)
+
+
+@dataclass
+class Func:
+    name: str
+    ret: str = "void"                   # 'u8' | 'void'
+    params: List[Tuple[str, str]] = field(default_factory=list)   # (名字, 'u8'|'ptr')
+    body: List[Stmt] = field(default_factory=list)
+    scope: Dict[str, Sym] = field(default_factory=dict)
+    ret_slot: int = 0
+    line: int = 0
 
 
 @dataclass
 class CompileUnit:
     source: str
-    vars: Dict[str, Var]
+    vars: Dict[str, Sym]
     body: List[Stmt]
     code: bytes
     listing: List[str]
     data_base: int = 0xD180
     strings: Dict[int, bytes] = field(default_factory=dict)
     protos: Dict[str, int] = field(default_factory=dict)   # 声明过的库函数 → 参数个数
+    funcs: Dict[str, Func] = field(default_factory=dict)
+    structs: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    initials: Dict[int, bytes] = field(default_factory=dict)   # 静态初值（程序开头写入）
 
 
 _TOKEN = re.compile(r"""
@@ -302,8 +356,8 @@ _TOKEN = re.compile(r"""
   | (?P<str>"(?:[^"\\]|\\.)*")
   | (?P<num>0[xX][0-9a-fA-F]+|\d+)
   | (?P<id>[A-Za-z_]\w*)
-  | (?P<op><<|>>|[-+*/%&|^~])
-  | (?P<punct>[{}();=,])
+  | (?P<op><<|>>|->|[-+*/%&|^~])
+  | (?P<punct>[{}();=,.\][])
 """, re.VERBOSE)
 
 
@@ -325,16 +379,30 @@ def _tokens(src: str, ) -> List[Tuple[str, str, int]]:
 
 
 class Parser:
+    """rGCC 前端：作用域、数组、结构体、函数（A2/A3/A5）。
+
+    内存模型：一个**线性分配器**把每个对象放进数据区（`data_base` 起）。
+    只要所有下标/字段偏移都是常量，地址在编译期就能算出来 —— 这正是本 ROM
+    能做的事（运行时算术要等 A4/A7 的字节传送与条件分支）。
+    """
+
     def __init__(self, src: str, data_base: int):
         self.toks = _tokens(src)
         self.i = 0
-        self.vars: Dict[str, Var] = {}
+        self.globals: Dict[str, Sym] = {}
         self.next_addr = data_base
-        self.protos: Dict[str, int] = {}          # 库函数原型：名字 → 参数个数
-        self.strings: List[bytes] = []            # 字符串常量池（去重）
+        self.protos: Dict[str, int] = {}
+        self.strings: List[bytes] = []
         self._str_ids: Dict[bytes, int] = {}
+        self.structs: Dict[str, Dict[str, int]] = {}
+        self.struct_size: Dict[str, int] = {}
+        self.funcs: Dict[str, Func] = {}
+        self.main: Optional[Func] = None
+        self.scope: Dict[str, Sym] = {}          # 当前函数作用域（全局时为空）
+        self.initials: Dict[int, bytes] = {}     # 静态初值
+        self.cur_fn: Optional[Func] = None
 
-    # ---- 基础
+    # ---------------------------------------------------------------- 基础
     def peek(self) -> Tuple[str, str, int]:
         return self.toks[self.i]
 
@@ -358,157 +426,429 @@ class Parser:
             raise RgccError("第 %d 行：期望 %s，实际 %r" % (t[2], kind, t[1]))
         return t
 
-    # ---- 语法
-    def parse(self) -> Tuple[Dict[str, Var], List[Stmt]]:
-        # 声明区：变量定义 + 库函数原型（来自 #include 的头文件）
-        while True:
-            kind, text, line = self.peek()
-            if text == "unsigned":
-                self.parse_decl()
-                continue
-            if text == "const":                      # `const unsigned char *p` 原型内部才允许
-                raise RgccError("第 %d 行：顶层只支持 `unsigned char 变量;` 或函数原型" % line)
-            if text == "void" and self.look(2)[1] == "(":
-                if self.look(1)[1] == "main":
-                    break
-                self.parse_proto()
-                continue
-            raise RgccError("第 %d 行：只支持 `unsigned char 变量;`、函数原型与 main()，"
-                            "实际是 %r" % (line, text))
-        self.expect("void")
-        fn = self.expect_kind("id")
-        if fn[1] != "main":
-            raise RgccError("第 %d 行：v0 只支持 main()" % fn[2])
-        self.expect("(")
-        if self.peek()[1] == "void":
+    # ---------------------------------------------------------------- 分配
+    def alloc(self, n: int, align: int = 1) -> int:
+        a = self.next_addr
+        if align > 1:
+            a = (a + align - 1) & ~(align - 1)
+        self.next_addr = a + n
+        if self.next_addr > 0xFFFF:
+            raise RgccError("数据区超出 16 位地址空间")
+        return a
+
+    def lookup(self, name: str, line: int) -> Sym:
+        if name in self.scope:
+            return self.scope[name]
+        if name in self.globals:
+            return self.globals[name]
+        raise RgccError("第 %d 行：未声明的名字 %s" % (line, name))
+
+    def define(self, sym: Sym) -> None:
+        table = self.scope if self.cur_fn is not None else self.globals
+        if sym.name in table or sym.name in self.protos or sym.name in self.funcs:
+            raise RgccError("名字 %s 重复定义" % sym.name)
+        table[sym.name] = sym
+
+    def sizeof(self, tname: str) -> int:
+        if tname == U8:
+            return 1
+        if tname.startswith("struct:"):
+            return self.struct_size[tname.split(":", 1)[1]]
+        if tname == "ptr":
+            return 2
+        raise RgccError("未知类型 %s" % tname)
+
+    # ---------------------------------------------------------------- 类型
+    def parse_type(self) -> Tuple[str, int]:
+        """声明说明符 → ``(基类型, 指针层数)``。``const`` 只是说明，直接跳过。"""
+        while self.peek()[1] == "const":
             self.next()
-        self.expect(")")
-        body = self.parse_block()
-        if self.peek()[0] != "eof":
-            raise RgccError("第 %d 行：main() 之后还有内容" % self.peek()[2])
-        return self.vars, body
+        t = self.peek()
+        if t[1] == "unsigned":
+            self.next()
+            self.expect("char")
+            base = U8
+        elif t[1] == "char":
+            self.next()
+            base = U8
+        elif t[1] == "void":
+            self.next()
+            base = "void"
+        elif t[1] == "struct":
+            self.next()
+            name = self.expect_kind("id")[1]
+            if name not in self.structs:
+                raise RgccError("第 %d 行：未定义的结构体 %s" % (t[2], name))
+            base = "struct:" + name
+        else:
+            raise RgccError("第 %d 行：只支持 unsigned char / char / void / struct，实际 %r"
+                            % (t[2], t[1]))
+        depth = 0
+        while self.peek()[1] == "*":
+            self.next()
+            depth += 1
+        return base, depth
 
-    def parse_proto(self) -> None:
-        """``void rprint(unsigned char font, unsigned char row, const unsigned char *text);``
+    # ------------------------------------------------------------ 顶层解析
+    def parse(self) -> Tuple[Dict[str, Sym], List[Stmt]]:
+        while self.peek()[0] != "eof":
+            self.parse_toplevel()
+        if self.main is None:
+            raise RgccError("没有 main()（程序入口）")
+        return self.globals, self.main.body
 
-        参数在 C 层只作说明用 —— 真正的"哪个参数进哪个寄存器"来自库 ABI 表
-        （``crop/libabi.py``）。这里只记下参数个数，用来做调用点的个数检查。
-        """
-        line = self.peek()[2]
-        self.expect("void")
-        name = self.expect_kind("id")[1]
-        self.expect("(")
-        depth, nargs, seen = 0, 0, False
-        while True:
-            kind, text, ln = self.next()
-            if kind == "eof":
-                raise RgccError("第 %d 行：原型 %s 没有结束的 ')'" % (line, name))
-            if text == "(":
-                depth += 1
-            elif text == ")":
-                if depth == 0:
-                    break
-                depth -= 1
-            elif text == "," and depth == 0:
-                nargs += 1
-            elif text not in ("void",):
-                seen = True
-        if seen:
-            nargs += 1
-        self.expect(";")
-        self.protos[name] = nargs
-
-    def parse_decl(self) -> None:
-        line = self.peek()[2]
-        if self.next()[1] != "unsigned":
-            raise RgccError("第 %d 行：只支持 unsigned char 声明" % line)
-        self.expect("char")
-        name = self.expect_kind("id")[1]
-        if name in self.vars:
-            raise RgccError("第 %d 行：变量 %s 重复声明" % (line, name))
-        self.vars[name] = Var(name=name, addr=self.next_addr)
-        self.next_addr += 1
-        self.expect(";")
-
-    def parse_block(self) -> List[Stmt]:
-        self.expect("{")
-        out: List[Stmt] = []
-        while self.peek()[1] != "}":
-            out.append(self.parse_stmt())
-        self.expect("}")
-        return out
-
-    def parse_stmt(self) -> Stmt:
+    def parse_toplevel(self) -> None:
         kind, text, line = self.peek()
-        if text in ("while", "for", "if", "do", "switch"):
-            if text != "while":
-                raise RgccError("第 %d 行：v0 只支持 while(1)（条件分支待第 4 步）" % line)
+        if text == "struct" and self.look(1)[0] == "id" and self.look(2)[1] == "{":
+            self.parse_struct_def()
+            return
+        base, depth = self.parse_type()
+        if self.peek()[1] == ";":                    # `struct foo;` 之类的前向声明
             self.next()
-            self.expect("(")
-            if self.peek()[0] != "num":
-                raise RgccError("第 %d 行：v0 只支持 while(1)（带条件的循环需要"
-                                "「条件分支原语」，本 ROM 暂无，见 step-2 报告）" % line)
-            v = self.next()[1]
-            if int(v, 0) != 1:
-                raise RgccError("第 %d 行：v0 只支持 while(1)；带条件的循环需要"
-                                "「条件分支原语」，本 ROM 暂无（见 step-2 报告）" % line)
-            self.expect(")")
-            return Stmt(kind="loop", body=self.parse_block(), line=line)
-        if kind == "id":
-            name = self.next()[1]
-            if self.peek()[1] == "(":                 # 函数调用语句
-                return self.parse_call(name, line)
-            if name not in self.vars:
-                raise RgccError("第 %d 行：未声明的变量 %s" % (line, name))
-            self.expect("=")
-            ep = _ExprParser(self.toks[self.i:])
-            e = ep.parse()
-            self.i += ep.i                          # 同步游标（parse 不消费 ';'）
-            self.expect(";")
-            got = _fold(e)
-            if got.kind == "const":
-                if not 0 <= got.value <= 255:
-                    raise RgccError("第 %d 行：结果 %d 超出字节 0..255" % (line, got.value))
-                return Stmt(kind="assign", var=name, value=got.value, line=line)
-            if got.var not in self.vars:
-                raise RgccError("第 %d 行：未声明的变量 %s" % (line, got.var))
-            return Stmt(kind="copy", var=name, value=0, src=got.var, line=line)
-        raise RgccError("第 %d 行：无法解析的语句 %r" % (line, text))
+            return
+        name = self.expect_kind("id")
+        if self.peek()[1] == "(":
+            self.parse_function(base, depth, name[1], name[2])
+            return
+        self.parse_object(base, depth, name[1], name[2], global_scope=True)
 
-    def parse_call(self, name: str, line: int) -> Stmt:
-        """``rprint(0x0E, row, "Hi");`` —— 参数只允许：常量、变量、字符串常量。"""
-        self.expect("(")
-        args: List[Tuple[str, object]] = []
-        if self.peek()[1] != ")":
+    def parse_struct_def(self) -> None:
+        self.expect("struct")
+        name = self.expect_kind("id")[1]
+        self.expect("{")
+        fields: Dict[str, int] = {}
+        off = 0
+        while self.peek()[1] != "}":
+            fbase, fdepth = self.parse_type()
+            fname = self.expect_kind("id")[1]
+            width = 2 if fdepth else self.sizeof(fbase)
+            if fname in fields:
+                raise RgccError("结构体 %s 里字段 %s 重复" % (name, fname))
+            fields[fname] = off
+            off += width
+            self.expect(";")
+        self.expect("}")
+        self.expect(";")
+        self.structs[name] = fields
+        self.struct_size[name] = off
+        if off == 0:
+            raise RgccError("结构体 %s 没有字段" % name)
+
+    def parse_object(self, base: str, depth: int, name: str, line: int,
+                     global_scope: bool = False) -> None:
+        """``unsigned char x;`` / ``unsigned char a[8];`` / ``unsigned char *p;`` / ``struct T v;``"""
+        if depth:
+            sym = Sym(name=name, addr=self.alloc(2, 2), kind="ptr", size=2,
+                      elem=base if base != "void" else U8)
+            self.define(sym)
+            self.parse_init_scalar(sym)
+            return
+        if self.peek()[1] == "[":                    # 数组
+            self.next()
+            n = self.const_expr("数组长度")
+            self.expect("]")
+            elem_size = self.sizeof(base)
+            sym = Sym(name=name, addr=self.alloc(n * elem_size, 2 if elem_size > 1 else 1),
+                      kind="array", size=n * elem_size, elem=base, count=n,
+                      fields=dict(self.structs.get(base.split(":", 1)[-1], {})))
+            self.define(sym)
+            self.parse_init_array(sym, line)
+            return
+        size = self.sizeof(base)
+        kind = "struct" if base.startswith("struct:") else "byte"
+        sym = Sym(name=name, addr=self.alloc(size, 2 if size > 1 else 1), kind=kind,
+                  size=size, elem=base,
+                  fields=dict(self.structs.get(base.split(":", 1)[-1], {})))
+        self.define(sym)
+        self.parse_init_scalar(sym)
+
+    def parse_init_scalar(self, sym: Sym) -> None:
+        if self.peek()[1] == "=":
+            self.next()
+            v = self.const_expr("初值")
+            self.initials[sym.addr] = bytes([v & 0xFF])
+        self.expect(";")
+
+    def parse_init_array(self, sym: Sym, line: int) -> None:
+        """支持 ``= "ABC"``（自动补 0）与 ``= {1,2,3}``。"""
+        if self.peek()[1] != "=":
+            self.expect(";")
+            return
+        self.next()
+        if self.peek()[0] == "str":
+            raw = self.next()[1][1:-1]
+            data = raw.encode("utf-8").decode("unicode_escape").encode("latin-1")
+            if len(data) + 1 > sym.size:
+                raise RgccError("第 %d 行：字符串 %r 放不进 %s" % (line, raw, sym.name))
+            self.initials[sym.addr] = data + b"\x00"
+            self.expect(";")
+            return
+        self.expect("{")
+        vals: List[int] = []
+        if self.peek()[1] != "}":
             while True:
-                kind, text, ln = self.peek()
-                if kind == "str":
+                vals.append(self.const_expr("数组初值"))
+                if self.peek()[1] == ",":
                     self.next()
-                    raw = text[1:-1]
-                    data = raw.encode("utf-8").decode("unicode_escape").encode("latin-1")
-                    if data not in self._str_ids:
-                        self._str_ids[data] = len(self.strings)
-                        self.strings.append(data)
-                    args.append(("str", self._str_ids[data]))
-                elif kind == "num":
-                    self.next()
-                    args.append(("const", int(text, 0)))
-                elif kind == "id":
-                    self.next()
-                    if text not in self.vars:
-                        raise RgccError("第 %d 行：调用 %s 时用了未声明的变量 %s"
-                                        % (ln, name, text))
-                    args.append(("var", self.vars[text].addr))
-                else:
-                    raise RgccError("第 %d 行：调用 %s 的参数只支持常量/变量/字符串，"
-                                    "实际是 %r" % (ln, name, text))
+                    continue
+                break
+        self.expect("}")
+        self.expect(";")
+        if len(vals) > sym.size:
+            raise RgccError("第 %d 行：初值太多（%d > %d）" % (line, len(vals), sym.size))
+        if vals:
+            self.initials[sym.addr] = bytes(v & 0xFF for v in vals)
+
+    def parse_function(self, base: str, depth: int, name: str, line: int) -> None:
+        self.expect("(")
+        params: List[Tuple[str, str]] = []
+        if self.peek()[1] == "void" and self.look(1)[1] == ")":
+            self.next()                                  # `(void)` = 无参数
+        elif self.peek()[1] != ")":
+            while self.peek()[1] != ")":
+                pbase, pdepth = self.parse_type()
+                pname = self.expect_kind("id")[1]
+                params.append((pname, "ptr" if pdepth else U8))
                 if self.peek()[1] == ",":
                     self.next()
                     continue
                 break
         self.expect(")")
+        if depth:
+            raise RgccError("第 %d 行：函数不能返回指针（先只支持 void / unsigned char）" % line)
+        if self.peek()[1] == ";":                    # 原型（库函数用）
+            self.next()
+            self.protos[name] = len(params)
+            return
+        ret = "void" if base == "void" else U8
+        fn = Func(name=name, ret=ret, params=params, line=line)
+        self.funcs[name] = fn
+        self.scope = fn.scope
+        self.cur_fn = fn
+        for pname, ptype in params:
+            fn.scope[pname] = Sym(name=pname, addr=self.alloc(2 if ptype == "ptr" else 1,
+                                                             2 if ptype == "ptr" else 1),
+                                  kind="ptr" if ptype == "ptr" else "byte",
+                                  size=2 if ptype == "ptr" else 1)
+        if ret == U8:
+            fn.ret_slot = self.alloc(1)
+        fn.body = self.parse_block()
+        self.scope = {}
+        self.cur_fn = None
+        if name == "main":
+            if base != "void" or params:
+                raise RgccError("第 %d 行：main 必须是 void main(void)" % line)
+            self.main = fn
+
+    # ------------------------------------------------------------ 语句解析
+    def parse_block(self) -> List[Stmt]:
+        self.expect("{")
+        out: List[Stmt] = []
+        while self.peek()[1] != "}":
+            st = self.parse_stmt()
+            if st is not None:
+                out.append(st)
+        self.expect("}")
+        return out
+
+    def parse_stmt(self) -> Optional[Stmt]:
+        kind, text, line = self.peek()
+        if text in ("unsigned", "char", "struct") and not (
+                text == "struct" and self.look(1)[1] == "("):
+            base, depth = self.parse_type()
+            name = self.expect_kind("id")
+            self.parse_object(base, depth, name[1], name[2])
+            return None
+        if text == "return":
+            self.next()
+            if self.peek()[1] == ";":
+                self.next()
+                return Stmt(kind="return", line=line)
+            if self.cur_fn is not None and self.cur_fn.ret != U8:
+                raise RgccError("第 %d 行：void 函数不能 return 值" % line)
+            ref = self.parse_rhs()
+            self.expect(";")
+            return Stmt(kind="return", src=ref, line=line)
+        if text in ("while", "for", "if", "do", "switch"):
+            return self.parse_control(text, line)
+        if kind == "id":
+            name = self.next()[1]
+            if self.peek()[1] == "(":                # 函数调用语句
+                return self.parse_call(name, line)
+            self.i -= 1                              # 回退到标识符
+            dst = self.parse_lvalue()
+            self.expect("=")
+            if self.peek()[0] == "id" and self.look(1)[1] == "(":   # x = f(...);
+                callee = self.next()[1]
+                args = self.parse_args()
+                self.expect(";")
+                if callee in self.protos and self.protos[callee] != len(args):
+                    raise RgccError("第 %d 行：%s 原型里有 %d 个参数，调用给了 %d 个"
+                                    % (line, callee, self.protos[callee], len(args)))
+                return Stmt(kind="call", name=callee, args=args, dst=dst, line=line)
+            src = self.parse_rhs()
+            self.expect(";")
+            if src.kind == "imm":
+                if not 0 <= src.value <= 255:
+                    raise RgccError("第 %d 行：结果 %d 超出字节 0..255" % (line, src.value))
+                return Stmt(kind="assign", dst=dst, value=src.value, line=line)
+            return Stmt(kind="copy", dst=dst, src=src, line=line)
+        raise RgccError("第 %d 行：无法解析的语句 %r" % (line, text))
+
+    def parse_control(self, text: str, line: int) -> Stmt:
+        if text != "while":
+            raise RgccError("第 %d 行：v0 只支持 while(1)（if/%s 需要条件分支，见 A7）" % (line, text))
+        self.next()
+        self.expect("(")
+        if self.peek()[0] != "num" or int(self.next()[1], 0) != 1:
+            raise RgccError("第 %d 行：目前只支持 while(1)；带条件的循环需要"
+                            "「条件分支原语」（A7，见 docs/step-2 报告）" % line)
+        self.expect(")")
+        return Stmt(kind="loop", body=self.parse_block(), line=line)
+
+    def parse_args(self) -> List[Tuple[str, object]]:
+        self.expect("(")
+        args: List[Tuple[str, object]] = []
+        if self.peek()[1] != ")":
+            while True:
+                args.append(self.parse_arg())
+                if self.peek()[1] == ",":
+                    self.next()
+                    continue
+                break
+        self.expect(")")
+        return args
+
+    def parse_call(self, name: str, line: int) -> Stmt:
+        args = self.parse_args()
         self.expect(";")
+        if name in self.protos and self.protos[name] != len(args):
+            raise RgccError("第 %d 行：%s 原型里有 %d 个参数，调用给了 %d 个" % (
+                line, name, self.protos[name], len(args)))
         return Stmt(kind="call", name=name, args=args, line=line)
+
+    def parse_arg(self) -> Tuple[str, object]:
+        """实参：常量 / 变量（取它的值）/ 数组、结构体、字符串（取地址）。"""
+        kind, text, line = self.peek()
+        if kind == "str":
+            self.next()
+            raw = text[1:-1]
+            data = raw.encode("utf-8").decode("unicode_escape").encode("latin-1")
+            if data not in self._str_ids:
+                self._str_ids[data] = len(self.strings)
+                self.strings.append(data)
+            return ("str", self._str_ids[data])
+        if kind == "num":
+            self.next()
+            return ("const", int(text, 0))
+        if kind == "id":
+            if self.look(1)[1] in ("[", "."):
+                ref = self.parse_lvalue()
+                if ref.kind != "const":
+                    raise RgccError("第 %d 行：还不支持把指针指向的东西当实参（A4）" % line)
+                return ("var", ref.value)
+            self.next()
+            sym = self.lookup(text, line)
+            if sym.kind in ("array", "struct"):
+                return ("const", sym.addr)           # 取地址
+            if sym.kind == "ptr":
+                if self.cur_fn is not None and text in [n for n, _ in self.cur_fn.params]:
+                    return ("ptrparam", text)        # 编译期可解析（内联时绑定）
+                return ("ptrvar", text)              # 运行时指针：需要 A4
+            return ("var", sym.addr)                 # 取该字节的值
+        raise RgccError("第 %d 行：实参只支持常量/变量/数组名/字符串，实际 %r" % (line, text))
+
+    # ------------------------------------------------------------ 左值/右值
+    def parse_lvalue(self) -> MemRef:
+        kind, text, line = self.peek()
+        if text == "*":                                   # *p
+            self.next()
+            inner = self.parse_lvalue()
+            if inner.kind == "ptrparam":
+                return inner
+            raise RgccError("第 %d 行：解引用需要编译期已知的指针（A4 的运行时指针还没做）" % line)
+        if kind != "id":
+            raise RgccError("第 %d 行：左值必须是变量/数组元素/结构体字段，实际 %r" % (line, text))
+        self.next()
+        sym = self.lookup(text, line)
+        if sym.kind == "ptr":
+            if not (self.cur_fn is not None and text in [n for n, _ in self.cur_fn.params]):
+                raise RgccError("第 %d 行：指针变量 %s 的解引用需要 A4 的字节传送" % (line, text))
+            ref = MemRef(kind="ptrparam", var=text, note="*" + text)
+            cur = Sym(name="(*%s)" % text, addr=0, kind="byte", size=1)
+            while self.peek()[1] == "[":
+                self.next()
+                idx = self.const_expr("指针下标")
+                self.expect("]")
+                ref.offset += idx
+                ref.note = "%s[%d]" % (text, idx)
+            while self.peek()[1] in (".", "->"):
+                self.next()
+                fname = self.expect_kind("id")[1]
+                if fname not in sym.fields:
+                    raise RgccError("第 %d 行：%s 没有字段 %s" % (line, ref.note, fname))
+                ref.offset += sym.fields[fname]
+                ref.note += "." + fname
+            return ref
+        ref = MemRef(kind="const", value=sym.addr, note=text)
+        cur = sym
+        while True:
+            t = self.peek()[1]
+            if t == "[":
+                if cur.kind != "array":
+                    raise RgccError("第 %d 行：%s 不是数组" % (line, ref.note))
+                self.next()
+                idx = self.const_expr("数组下标")
+                self.expect("]")
+                if not 0 <= idx < cur.count:
+                    raise RgccError("第 %d 行：下标 %d 越界（%s 长 %d）" % (line, idx, cur.name, cur.count))
+                elem_size = self.sizeof(cur.elem)
+                ref.value = cur.addr + idx * elem_size
+                ref.note = "%s[%d]" % (cur.name, idx)
+                cur = Sym(name=ref.note, addr=ref.value,
+                          kind="struct" if cur.elem.startswith("struct:") else "byte",
+                          size=elem_size, elem=cur.elem,
+                          fields=dict(self.structs.get(cur.elem.split(":", 1)[-1], {})))
+                continue
+            if t == "." or t == "->":
+                if t == "->":
+                    raise RgccError("第 %d 行：'->' 需要指针（A4）" % line)
+                self.next()
+                fname = self.expect_kind("id")[1]
+                if cur.kind != "struct" or fname not in cur.fields:
+                    raise RgccError("第 %d 行：%s 没有字段 %s" % (line, ref.note, fname))
+                ref.value = cur.addr + cur.fields[fname]
+                ref.note = ref.note + "." + fname
+                cur = Sym(name=ref.note, addr=ref.value, kind="byte", size=1)
+                continue
+            break
+        return ref
+
+    def parse_rhs(self) -> MemRef:
+        """右值：``a[2]`` / ``p.x`` 这类内存位置，或常量/单变量的表达式。"""
+        if self.peek()[1] == "*" or (self.peek()[0] == "id" and self.look(1)[1] in ("[", ".")):
+            return self.parse_lvalue()
+        ep = _ExprParser(self.toks[self.i:])
+        e = ep.parse()
+        self.i += ep.i                                   # parse 不消费 ';'
+        got = _fold(e)
+        if got.kind == "const":
+            return MemRef(kind="imm", value=got.value, note=str(got.value))
+        sym = self.lookup(got.var, self.peek()[2])
+        if sym.kind != "byte":
+            raise RgccError("第 %d 行：%s 不是单字节变量（数组/结构体要先写下标）"
+                            % (self.peek()[2], got.var))
+        return MemRef(kind="const", value=sym.addr, note=got.var)
+
+    def const_expr(self, what: str) -> int:
+        """常量表达式（下标/长度/初值）——必须是编译期可算的。"""
+        ep = _ExprParser(self.toks[self.i:])
+        e = ep.parse(stops=("]", ",", "}", ";"))
+        self.i += ep.i
+        got = _fold(e)
+        if got.kind != "const":
+            raise RgccError("%s 必须是编译期常量（运行时算术/索引见 A4/A7）" % what)
+        return got.value
 
 
 # ----------------------------------------------------------------- 表达式
@@ -587,10 +927,11 @@ class _ExprParser:
         self.i += 1
         return tok
 
-    def parse(self) -> Expr:
+    def parse(self, stops=(";",)) -> Expr:
         e = self.binary(1)
-        if self.peek()[1] != ";":
-            raise RgccError("第 %d 行：表达式里多余的记号 %r" % (self.peek()[2], self.peek()[1]))
+        if self.peek()[1] not in stops:
+            raise RgccError("第 %d 行：表达式里多余的记号 %r（期望 %s）"
+                            % (self.peek()[2], self.peek()[1], "/".join(stops)))
         return e
 
     def binary(self, min_prec: int) -> Expr:
@@ -629,25 +970,30 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
                    lib: Optional[object] = None) -> CompileUnit:
     """把 C 子集源码编译成 nX-U16 机器码，并核对每条指令都有 gadget。
 
-    ``lib``：``crop/libabi.py`` 的 ``Library``；给了才允许调用库函数（A1）。
+    ``lib``：``crop/libabi.py`` 的 ``Library``；给了才允许调用 ROM 库例程。
+    用户函数用**内联**实现（ROP 链没有真正的调用栈）：调用点先把实参写进形参槽，
+    再把函数体展开一遍；``return`` 编成一条无条件跳转（L3 已有）。
     """
     parser = Parser(src, data_base)
-    vars_, body = parser.parse()
+    globals_, main_body = parser.parse()
 
-    # ---- 字符串常量池：放在变量区之后（留 8 字节，避开块写的 2 字节溢出）----
+    # ---- 初值/字符串常量：放在所有变量之后（留 8 字节避开块写的 2 字节溢出）----
     str_addr: Dict[int, int] = {}
-    at = (data_base + len(vars_) + 8) & ~1
-    strings: Dict[int, bytes] = {}
-    for data in parser.strings:
-        str_addr[parser._str_ids[data]] = at
-        strings[at] = data + b"\x00"
-        at = (at + len(data) + 2) & ~1
+    data: Dict[int, bytes] = dict(parser.initials)
+    at = (parser.next_addr + 8) & ~1
+    for s in parser.strings:
+        str_addr[parser._str_ids[s]] = at
+        data[at] = s + b"\x00"
+        at = (at + len(s) + 2) & ~1
 
     code = bytearray()
     listing: List[str] = []
-    labels: Dict[int, str] = {}      # 结点 id → label
-    fixups: List[Tuple[int, int]] = []   # (B 指令所在偏移, 目标结点 id)
-    node_id = [0]
+    label_off: Dict[int, int] = {}
+    label_name: Dict[int, str] = {}
+    fixups: List[Tuple[int, int]] = []
+    node = [0]
+    inline_stack: List[str] = []
+    ptr_stack: List[Dict[str, int]] = []      # 指针形参 → 编译期已知地址（内联时绑定）
 
     def emit(b: bytes, text: str) -> int:
         off = len(code)
@@ -655,105 +1001,212 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
         listing.append("%04X  %-11s %s" % (off, b.hex(" ").upper(), text))
         return off
 
-    # ---- 只读数据（字符串）初始化：程序一开头写进 RAM ----
-    for addr in sorted(strings):
-        data = strings[addr]
-        for off in range(0, len(data), 6):
-            chunk = data[off:off + 6]
-            emit(backend.block_write(addr + off, chunk),
-                 "字符串 [%04X] ← %s" % (addr + off, " ".join("%02X" % c for c in chunk)))
+    def new_label(tag: str) -> int:
+        node[0] += 1
+        label_off[node[0]] = -1
+        label_name[node[0]] = "L%d_%s" % (node[0], tag)
+        return node[0]
 
-    def resolve(args) -> List[Tuple[str, int]]:
+    def place(lid: int) -> None:
+        label_off[lid] = len(code)
+        listing.append("      %-22s // = %04X" % (label_name[lid] + ":", len(code)))
+
+    def jump(lid: int, text: str) -> None:
+        at2 = emit(bytes([0x00, 0xF0, 0x00, 0x00]), text)
+        fixups.append((at2, lid))
+
+    def ptr_addr(name: str, line: int) -> int:
+        for frame in reversed(ptr_stack):
+            if name in frame:
+                return frame[name]
+        raise RgccError("第 %d 行：指针 %s 没有绑定到编译期已知的地址"
+                        "（运行时指针需要 A4）" % (line, name))
+
+    def addr(ref: MemRef, line: int) -> int:
+        if ref.kind == "const":
+            return ref.value
+        if ref.kind == "ptrparam":
+            return ptr_addr(ref.var, line) + ref.offset
+        raise RgccError("第 %d 行：地址要在运行时算（A4 的字节传送还没做）" % line)
+
+    def resolve(args, line: int = 0) -> List[Tuple[str, int]]:
         out: List[Tuple[str, int]] = []
-        for kind, val in args:
-            out.append(("const", str_addr[val]) if kind == "str" else (kind, val))
+        for k, v in args:
+            if k == "str":
+                out.append(("const", str_addr[v]))
+            elif k == "ptrparam":
+                out.append(("const", ptr_addr(v, line)))
+            elif k == "ptrvar":
+                raise RgccError("第 %d 行：把指针变量当实参需要 A4 的字节传送"
+                                "（编译期已知的指针请用形参或数组名）" % line)
+            else:
+                out.append((k, v))
         return out
 
-    def gen(stmts: List[Stmt]) -> None:
+    # ---- 初值/字符串写入：程序一开头做（块写 gadget，6 字节一组，地址递增）----
+    for daddr in sorted(data):
+        blob = data[daddr]
+        for off in range(0, len(blob), 6):
+            chunk = blob[off:off + 6]
+            emit(backend.block_write(daddr + off, chunk),
+                 "初值 [%04X] ← %s" % (daddr + off, " ".join("%02X" % c for c in chunk)))
+
+    all_objs = list(globals_.values()) + [s for f in parser.funcs.values()
+                                          for s in f.scope.values()]
+
+    def gen(stmts: List[Stmt], scope: Dict[str, Sym], cur: Func,
+            end_label: Optional[int]) -> None:
         i = 0
         while i < len(stmts):
             st = stmts[i]
-            # --- 库函数调用（参数搬运 + 进入 ROM 例程）---
+
+            # ---------------- 函数调用 ----------------
             if st.kind == "call":
+                fn = parser.funcs.get(st.name)
+                if fn is not None:                       # 用户函数 → 内联
+                    if st.name in inline_stack:
+                        raise RgccError("第 %d 行：递归调用 %s（ROP 链没有真正的调用栈）"
+                                        % (st.line, st.name))
+                    if len(inline_stack) >= 6:
+                        raise RgccError("第 %d 行：内联层数太深（>6）" % st.line)
+                    args = resolve(st.args, st.line)
+                    if len(args) != len(fn.params):
+                        raise RgccError("第 %d 行：%s 要 %d 个参数，给了 %d 个"
+                                        % (st.line, st.name, len(fn.params), len(args)))
+                    bind: Dict[str, int] = {}
+                    for (pname, ptype), (ak, av) in zip(fn.params, args):
+                        slot = fn.scope[pname]
+                        if ptype == "ptr":
+                            # 指针形参在编译期就绑定成具体地址（内联展开 → 常量传播）
+                            if ak == "const":
+                                bind[pname] = av
+                            elif ak == "ptrparam":
+                                bind[pname] = ptr_addr(av, st.line)
+                            else:
+                                raise RgccError("第 %d 行：%s 的指针实参要在运行时算地址"
+                                                "（A4 的字节传送还没做）" % (st.line, st.name))
+                            continue
+                        if ak == "const":
+                            emit(backend.write_byte_imm(slot.addr, av),
+                                 "%s ← %d（实参）" % (pname, av))
+                        else:
+                            emit(backend.copy_var(slot.addr, av),
+                                 "%s ← [%04X]（实参）" % (pname, av))
+                    end = new_label("ret_" + fn.name)
+                    listing.append("      // ---- 内联 %s()%s ----" % (
+                        fn.name, "".join("  %s=%04X" % (k, v) for k, v in bind.items())))
+                    inline_stack.append(st.name)
+                    ptr_stack.append(bind)
+                    gen(fn.body, fn.scope, fn, end)
+                    ptr_stack.pop()
+                    inline_stack.pop()
+                    place(end)
+                    if st.dst is not None:               # `x = f(...)`
+                        if fn.ret != "u8":
+                            raise RgccError("第 %d 行：%s 没有返回值" % (st.line, st.name))
+                        emit(backend.copy_var(addr(st.dst, st.line), fn.ret_slot),
+                             "%s = [%04X]（返回值）" % (st.dst.note, fn.ret_slot))
+                    i += 1
+                    continue
                 if lib is None:
                     raise RgccError("第 %d 行：调用了 %s，但编译时没给库表"
                                     "（tools/rgcc --labels labels.conf）" % (st.line, st.name))
-                if st.name in parser.protos and parser.protos[st.name] != len(st.args):
-                    raise RgccError("第 %d 行：%s 原型里有 %d 个参数，调用给了 %d 个" % (
-                        st.line, st.name, parser.protos[st.name], len(st.args)))
+                if st.dst is not None:
+                    raise RgccError("第 %d 行：库函数 %s 没有返回值" % (st.line, st.name))
                 try:
-                    body_bytes = lib.emit_call(st.name, resolve(st.args))
-                except Exception as e:            # LibError 等 → 编译错误
+                    body_bytes = lib.emit_call(st.name, resolve(st.args, st.line))
+                except RgccError:
+                    raise
+                except Exception as e:                   # LibError 等 → 编译错误
                     raise RgccError("第 %d 行：调用 %s 失败：%s" % (st.line, st.name, e))
                 r = lib.routine(st.name)
                 emit(body_bytes, "%s(...);   // 搬运参数 + 例程 @%05X（%d 条指令，%s 结尾）"
                      % (st.name, r.entry, r.ninsn, r.term))
                 i += 1
                 continue
-            # --- 块写：连续的「地址相邻的常量赋值」合并成 1 次 8 字节写 ---
+
+            # ---------------- return ----------------
+            if st.kind == "return":
+                if end_label is None:
+                    raise RgccError("第 %d 行：main 里不能 return（用 while(1) 挂住）" % st.line)
+                if st.src is not None:
+                    if cur.ret != "u8":
+                        raise RgccError("第 %d 行：void 函数不能 return 值" % st.line)
+                    if st.src.kind == "imm":
+                        emit(backend.write_byte_imm(cur.ret_slot, st.src.value),
+                             "返回值 ← %d" % st.src.value)
+                    else:
+                        emit(backend.copy_var(cur.ret_slot, addr(st.src, st.line)),
+                             "返回值 ← %s" % st.src.label())
+                jump(end_label, "B %s   // return" % label_name[end_label])
+                i += 1
+                continue
+
+            # ---------------- 归并常量赋值（块写 gadget 一次 6 字节）----------------
             if st.kind == "assign" and backend.blk_pop:
                 run = [st]
                 j = i + 1
                 while (j < len(stmts) and stmts[j].kind == "assign"
-                       and vars_[stmts[j].var].addr == vars_[run[-1].var].addr + 1
+                       and addr(stmts[j].dst, stmts[j].line) == addr(run[-1].dst, run[-1].line) + 1
                        and len(run) < backend.blk_pop_len - 2):
                     run.append(stmts[j])
                     j += 1
-                # 归并写会把 run_start+6 / +7 两个字节踩成 R8/R9：
-                # 这段范围里还住着别的变量时不能归并（否则会悄悄改掉它）。
-                a0 = vars_[run[0].var].addr
-                a_end = vars_[run[-1].var].addr
-                busy = any(a0 <= v.addr <= a0 + 7 for v in vars_.values()
-                           if not (a0 <= v.addr <= a_end))
+                a0 = addr(run[0].dst, run[0].line)
+                a_end = addr(run[-1].dst, run[-1].line)
+                busy = any(a0 <= o.addr <= a0 + 7 for o in all_objs
+                           if not (a0 <= o.addr <= a_end))
                 if len(run) >= 3 and not busy:
-                    off = emit(backend.block_write(a0, [x.value for x in run]),
-                               "块写 %04X..%04X = %s" % (a0, a_end,
-                                                       " ".join("%02X" % x.value for x in run)))
+                    blk = backend.block_write(a0, [x.value for x in run])
+                    off = emit(blk, "块写 %04X..%04X = %s" % (
+                        a0, a_end, " ".join("%02X" % x.value for x in run)))
                     listing.append("%04X  %-11s （POP QR%d 的内联 8 字节）" % (
-                        off + 2, " ".join("%02X" % b for b in backend.block_write(
-                            a0, [x.value for x in run])[len(backend.blk_pop):len(backend.blk_pop) + 8]),
+                        off + 2,
+                        " ".join("%02X" % b for b in blk[len(backend.blk_pop):len(backend.blk_pop) + 8]),
                         backend.blk_qr))
                     i = j
                     continue
+
             if st.kind == "assign":
-                v = vars_[st.var]
-                off = len(code)
-                emit(backend.write_byte_imm(v.addr, st.value),
-                     "%s = %d;            // [%04X] ← %02X" % (st.var, st.value, v.addr, st.value))
-                listing.append("%04X  %-11s （POP XR0 的链数据）" % (off + 2, backend.chain_data(v.addr, st.value).hex(" ").upper()))
+                da = addr(st.dst, st.line)
+                emit(backend.write_byte_imm(da, st.value),
+                     "%s = %d;            // [%04X] ← %02X" % (st.dst.note, st.value, da, st.value))
             elif st.kind == "copy":
-                d, sr = vars_[st.var], vars_[st.src]
-                emit(backend.copy_var(d.addr, sr.addr),
-                     "%s = %s;            // [%04X] ← [%04X]" % (st.var, st.src, d.addr, sr.addr))
+                da, sa = addr(st.dst, st.line), addr(st.src, st.line)
+                emit(backend.copy_var(da, sa),
+                     "%s = %s;            // [%04X] ← [%04X]" % (st.dst.note, st.src.note, da, sa))
             elif st.kind == "loop":
-                node_id[0] += 1
-                lid = node_id[0]
-                labels[lid] = "L%d" % lid
-                start = len(code)
-                listing.append("      %s:                       // while(1) 起点 = %04X" % (labels[lid], start))
-                gen(st.body)
-                # `B csr:addr` 4 字节：[0x00][0xF0][addr_lo][addr_hi]
-                at2 = emit(bytes([0x00, 0xF0, 0x00, 0x00]),
-                           "B %s                  // 无条件回跳" % labels[lid])
-                fixups.append((at2, lid))
-            else:                                  # pragma: no cover - 防御
+                lid = new_label("loop")
+                listing.append("      // while(1) ----")
+                place(lid)
+                gen(st.body, scope, cur, end_label)
+                jump(lid, "B %s   // 无条件回跳" % label_name[lid])
+            else:                                        # pragma: no cover - 防御
                 raise RgccError("未知语句 %s" % st.kind)
             i += 1
 
-    gen(body)
-    # 回填跳转（B 是 4 字节绝对地址：低字节在先，段号在最后）
+    gen(main_body, globals_, parser.main, None)
+
+    # 回填跳转（B 是 4 字节绝对地址：低字节在先）
     for at2, lid in fixups:
-        # 目标必须落在自身代码里；段号固定 0（解释器只按 .bin 内偏移解析标签）
-        target = _label_offset(listing, labels[lid])
+        target = label_off[lid]
+        if target < 0:                                   # pragma: no cover - 防御
+            raise RgccError("内部错误：标签 %s 没有落地" % label_name[lid])
         code[at2 + 2] = target & 0xFF
         code[at2 + 3] = (target >> 8) & 0xFF
 
     # ---- 核对：每条指令都必须有 gadget（否则"解释器覆盖 100%"不成立）
     routines = tuple(getattr(lib, "routines", {}).values()) if lib is not None else ()
     verify_translatable(bytes(code), backend.db, routines=routines)
-    return CompileUnit(source=src, vars=vars_, body=body, code=bytes(code),
-                       listing=listing, data_base=data_base, strings=strings,
-                       protos=dict(parser.protos))
+
+    allvars: Dict[str, Sym] = {}
+    for f in list(parser.funcs.values()) + []:
+        for k, v in f.scope.items():
+            allvars.setdefault(k, v)
+    allvars.update(globals_)
+    return CompileUnit(source=src, vars=allvars, body=main_body, code=bytes(code),
+                       listing=listing, data_base=data_base, strings=data,
+                       protos=dict(parser.protos), funcs=dict(parser.funcs),
+                       structs=dict(parser.structs), initials=dict(parser.initials))
 
 
 def _label_offset(listing: Sequence[str], label: str) -> int:
