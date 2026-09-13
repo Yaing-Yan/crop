@@ -28,9 +28,11 @@ class TestLauncher(unittest.TestCase):
 
     def test_config_roundtrip(self):
         cfg = parse_conf(open(CONF).read())
-        self.assertEqual(cfg.left_addr, 0xE9E0)
-        self.assertEqual(cfg.launcher_addr, 0xD180)
-        self.assertEqual(cfg.launcher(), launcher_bytes(0xE9E0))
+        # 这些是**真机实测验证过**的值（见 docs/注入规程.md）
+        self.assertEqual(cfg.left_addr, 0xEC00)        # 链存放处（避开机器栈 E9xx~EBxx）
+        self.assertEqual(cfg.launcher_addr, 0xD248)    # 回放区＝输入缓冲区（源）
+        self.assertEqual(cfg.len_field, 0xD244)        # 长度/光标账本
+        self.assertEqual(cfg.launcher(), launcher_bytes(0xEC00))
 
 
 @unittest.skipUnless(os.path.isdir(MODEL), "缺少参考机型")
