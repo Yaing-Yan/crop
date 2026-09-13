@@ -143,7 +143,15 @@ def main() -> int:
                    rt_push=lib.rt_push)
     res = translate(db, code, opts)
     chain = res.data
+    # launcher 的枢轴按**本 ROM 扫描**推导（launcher.conf 里那串只作对照），
+    # 这样同一个工具/同一份 C 源码能直接跑 VerC、VerF……
+    from crop.launcher import launcher_for_db
+    derived, pivot = launcher_for_db(db, conf.left_addr)
     launcher = conf.launcher()
+    if launcher != derived:
+        print("⚠ launcher.conf 模板(%s) 与本 ROM 扫描结果(%s，枢轴 @%05X) 不同 → 用扫描结果"
+              % (launcher.hex(" ").upper(), derived.hex(" ").upper(), pivot.addr))
+        launcher = derived
     print("链 %d 字节 → %04X；launcher %d 字节 → %04X；账本 %04X = %02X"
           % (len(chain), conf.left_addr, len(launcher), conf.launcher_addr,
              conf.len_field, conf.len_value))
@@ -167,6 +175,7 @@ def main() -> int:
     rpc("write_memory", {"address": conf.launcher_addr, "bytes": list(launcher)}, **kw)
     rpc("write_memory", {"address": conf.len_field,
                          "bytes": [conf.len_value] * 4}, **kw)
+    time.sleep(0.3)                     # 等模拟器把写操作落到 RAM，再回读
     back = read_mem(conf.left_addr, len(chain), **kw)
     print("链回读%s" % ("一致 ✓" if back == chain else "不一致 ✗"))
 
