@@ -63,6 +63,14 @@ def write_mem(addr: int, data: bytes, **kw) -> str:
 
 def read_mem(addr: int, size: int, **kw) -> bytes:
     txt = rpc("read_memory", {"address": addr, "size": size}, **kw)
+    try:                                    # 新版回 JSON：{"address":…, "bytes":[…]}
+        obj = json.loads(txt)
+        if isinstance(obj, dict) and isinstance(obj.get("bytes"), list):
+            b = bytes(int(x) & 0xFF for x in obj["bytes"])
+            if len(b) >= size:
+                return b[:size]
+    except ValueError:
+        pass
     hexes = []
     for tok in txt.replace(",", " ").split():
         tok = tok.strip("[](){}").lstrip("0x").rstrip("hH")
