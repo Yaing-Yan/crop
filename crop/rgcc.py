@@ -1152,10 +1152,11 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
         return out
 
     # ---- 初值/字符串写入：程序一开头做（块写 gadget，6 字节一组，地址递增）----
+    chunk_max = backend.blk_pop_len or 6          # 一个 POP QRn 能装多少就写多少（VerF=8）
     for daddr in sorted(data):
         blob = data[daddr]
-        for off in range(0, len(blob), 6):
-            chunk = blob[off:off + 6]
+        for off in range(0, len(blob), chunk_max):
+            chunk = blob[off:off + chunk_max]
             emit(backend.block_write(daddr + off, chunk),
                  "初值 [%04X] ← %s" % (daddr + off, " ".join("%02X" % c for c in chunk)))
 
@@ -1260,12 +1261,12 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
                 j = i + 1
                 while (j < len(stmts) and stmts[j].kind == "assign"
                        and addr(stmts[j].dst, stmts[j].line) == addr(run[-1].dst, run[-1].line) + 1
-                       and len(run) < backend.blk_pop_len - 2):
+                       and len(run) < backend.blk_pop_len):
                     run.append(stmts[j])
                     j += 1
                 a0 = addr(run[0].dst, run[0].line)
                 a_end = addr(run[-1].dst, run[-1].line)
-                busy = any(a0 <= o.addr <= a0 + 7 for o in all_objs
+                busy = any(a0 <= o.addr <= a0 + backend.blk_pop_len + 1 for o in all_objs
                            if not (a0 <= o.addr <= a_end))
                 if len(run) >= 3 and not busy:
                     blk = backend.block_write(a0, [x.value for x in run])
