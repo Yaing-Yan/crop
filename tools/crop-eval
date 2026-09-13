@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""crop-eval —— 用真实 ROM 函数体评估"ROP 解释器能翻译多少"（第 2 步的匹配度指标）。
+
+ROM 是卡西欧自己的 nX-U16 C 编译器产物，所以拿它的函数体当 rGCC 输出的代理
+是最贴近的评估。逐个函数（`PUSH LR` … 末尾 `POP PC`）翻译，统计 L1/L2/不支持。
+
+    tools/crop-eval --rom-dir ~/casioemu/models/fx991cnxfVirtual --limit 200
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from crop.gadget import scan                        # noqa: E402
+from crop.interp import Options, translate           # noqa: E402
+from crop.nxu16 import decode as _dec                # noqa: E402
+from crop.rom import RomImage                        # noqa: E402
+
+
+def find_functions(rom: RomImage, limit: int | None = None):
+    """找函数体：`PUSH LR`（CE F8）开头，向后扫到第一个 POP PC 为止。"""
+    out = []
+    space = rom.space
+    for rf in rom.files:
+        base, end = rf.base_addr, rf.base_addr + len(rf.data)
+        for a in range(base, end - 3, 2):
+            if space[a] != 0xCE or space[a + 1] != 0xF8:
+                continue
+            prev = _dec.decode_at(space, a - 2) if a >= base + 2 else None
+            if prev is not None and prev.cls not in ("term_pop_pc", "ret", "jump", "branch", "call"):
+                continue                      # 只认函数开头
+            b = a + 2
+            body_start = b
+            while b < end:
+                ins = _dec.decode_at(space, b)
+                if ins is None:
+                    break
+                b += ins.size
+                if ins.cls == "term_pop_pc":
+                    if b - body_start >= 8:
+                        out.append(bytes(space[body_start:b - ins.size]))
+                        if limit and len(out) >= limit:
+                            return out
+                    break
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="ROP 翻译覆盖率评估（用真实 ROM 函数体）")
+    ap.add_argument("--rom-dir", required=True)
+    ap.add_argument("-r", "--rom", action="append", default=[])
+    ap.add_argument("--limit", type=int, default=150, help="最多评估多少个函数体")
+    ap.add_argument("--max-insns", type=int, default=8)
+    ap.add_argument("--show", type=int, default=0, help="打印前 N 个函数的翻译明细")
+    args = ap.parse_args()
+
+    rom = RomImage.auto(args.rom_dir) if args.rom_dir else RomImage.from_paths(args.rom)
+    db = scan(rom, max_insns=args.max_insns)
+    funcs = find_functions(rom, args.limit)
+    print("ROM：%s；取到 %d 个函数体做评估" % (
+        ", ".join(os.path.basename(f.path) for f in rom.files), len(funcs)))
+
+    tot = collections.Counter()
+    unsup = collections.Counter()
+    chains = 0
+    per_func = []
+    for body in funcs:
+        res = translate(db, body, Options(max_insns=args.max_insns))
+        s = res.stats
+        for k in ("insns", "l1", "l2", "jump", "unsupported", "chain_bytes", "blocks"):
+            tot[k] += s[k]
+        chains += len(res.data)
+        for d in res.decisions:
+            if d.kind == "unsupported":
+                unsup[d.detail.split("（")[0]] += 1
+        per_func.append((len(body), s["l1"] + s["l2"], s["unsupported"]))
+    n = max(1, tot["insns"])
+    print()
+    print("合计指令 %d 条：L1 块复用 %d (%.1f%%)，L2 等价转义 %d (%.1f%%)，"
+          "跳转 %d，不支持 %d (%.1f%%)" % (
+              tot["insns"], tot["l1"], 100 * tot["l1"] / n, tot["l2"], 100 * tot["l2"] / n,
+              tot["jump"], tot["unsupported"], 100 * tot["unsupported"] / n))
+    print("链总长 %d 字节（%.2f 字节/指令）；每函数平均链长 %.1f 字节" % (
+        chains, chains / n, chains / max(1, len(funcs))))
+    print()
+    print("最常无法翻译的指令（前 12）：")
+    for t, c in unsup.most_common(12):
+        print("  ×%-5d %s" % (c, t))
+    if args.show:
+        print()
+        for body in funcs[:args.show]:
+            res = translate(db, body, Options(max_insns=args.max_insns))
+            print("---- %d 字节函数体 ----" % len(body))
+            print(res.report())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

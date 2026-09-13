@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""crop-gadgets —— 扫描 ROM.bin，建立/报告 ROP gadget 索引。
+
+用法示例：
+    tools/crop-gadgets -r ~/casioemu/models/fx991cnxfVirtual/rom.bin
+    tools/crop-gadgets --rom-dir ~/casioemu/models/fx991cnxfVirtual --demo 2000
+    tools/crop-gadgets -r rom.bin --json out/gadgets.json
+
+``--demo`` 做可行性评估：把 ROM 里现成的"直线代码段"当作假想的 rGCC 输出，
+统计"逐字节相同 + 后面紧跟 POP PC"的块复用率。抽样来源有两种：
+
+* ``random``（默认）—— 随机偏移处的 normal 指令流，代表"任意代码"；
+* ``functions``     —— 只取函数体（``PUSH LR`` 之后）里的 normal 指令流，
+  代表"真实编译器生成的 C 代码"（ROM 本来就是卡西欧自己的 C 编译器产物，
+  所以这是对 rGCC 输出最贴切的代理）。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import sys
+import time
+from typing import List, Optional, Sequence
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from crop.gadget import GadgetDB, scan, split_greedy      # noqa: E402
+from crop.nxu16 import decode as _dec                     # noqa: E402
+from crop.nxu16.decode import Insn                        # noqa: E402
+from crop.rom import RomImage                             # noqa: E402
+
+
+def build_rom(args) -> RomImage:
+    if args.rom_dir:
+        return RomImage.auto(args.rom_dir, primary_only=not args.all_roms)
+    if not args.rom:
+        raise SystemExit("需要 -r ROM 或 --rom-dir DIR")
+    return RomImage.from_paths(args.rom)
+
+
+# ------------------------------------------------------------------ 抽样来源
+def _runs_from(rom: RomImage, starts: Sequence[int], min_len: int, max_len: int) -> List[List[Insn]]:
+    """从若干起点收集"连续 normal 指令"序列。"""
+    runs: List[List[Insn]] = []
+    for a in starts:
+        seq: List[Insn] = []
+        b = a
+        while len(seq) < max_len:
+            ins = _dec.decode_at(rom.space, b)
+            if ins is None or ins.cls != "normal" or ins.sp_delta:
+                break
+            seq.append(ins)
+            b += ins.size
+        if len(seq) >= min_len:
+            runs.append(seq)
+    return runs
+
+
+def sample_random(rom: RomImage, n: int, min_len: int, max_len: int, seed: int = 1) -> List[List[Insn]]:
+    rng = random.Random(seed)
+    starts = []
+    tries = 0
+    while len(starts) < n * 4 and tries < n * 200:
+        tries += 1
+        rf = rng.choice(rom.files)
+        starts.append(rf.base_addr + 2 * rng.randrange(max(1, len(rf.data) // 2 - 64)))
+    return _runs_from(rom, starts, min_len, max_len)[:n]
+
+
+def sample_functions(rom: RomImage, min_len: int, max_len: int, limit: Optional[int] = None) -> List[List[Insn]]:
+    """找 ``PUSH LR``（CE F8）函数开头，取其后的 normal 指令流。"""
+    starts: List[int] = []
+    space = rom.space
+    for rf in rom.files:
+        base, end = rf.base_addr, rf.base_addr + len(rf.data)
+        for a in range(base, end - 3, 2):
+            if space[a] == 0xCE and space[a + 1] == 0xF8:
+                # 只认"函数开头"：前一条指令不是可落入的 normal 指令
+                prev = _dec.decode_at(space, a - 2) if a >= base + 2 else None
+                if prev is None or prev.cls in ("term_pop_pc", "ret", "jump", "branch", "call"):
+                    starts.append(a + 2)
+    runs = _runs_from(rom, starts, min_len, max_len)
+    return runs[:limit] if limit else runs
+
+
+# ------------------------------------------------------------------ 分析
+def analyze(db: GadgetDB, runs: List[List[Insn]], max_insns: int, title: str) -> str:
+    out = [title]
+    out.append("  样本：%d 段直线代码，共 %d 条指令" % (len(runs), sum(len(r) for r in runs)))
+
+    out.append("  [A] 连续 k 条指令存在等价 gadget（末尾紧跟 POP PC）的比例：")
+    for k in range(1, max_insns + 1):
+        hit = tot = 0
+        for seq in runs:
+            for s in range(0, len(seq) - k + 1):
+                code = b"".join(i.raw for i in seq[s:s + k])
+                tot += 1
+                if db.lookup(code):
+                    hit += 1
+        out.append("      k=%2d : %6d/%6d = %5.1f%%" % (k, hit, tot, 100.0 * hit / max(1, tot)))
+
+    total_insn = matched_insn = blocks_n = leftover_n = 0
+    lens, miss = {}, {}
+    for seq in runs:
+        code = b"".join(i.raw for i in seq)
+        blocks, left = split_greedy(db, code, max_insns=max_insns)
+        total_insn += len(seq)
+        for blk in blocks:
+            blocks_n += 1
+            matched_insn += blk.ninsn
+            lens[blk.ninsn] = lens.get(blk.ninsn, 0) + 1
+        leftover_n += len(left)
+        for ins in left:
+            miss[ins.text] = miss.get(ins.text, 0) + 1
+    out.append("  [B] 贪心最长匹配：%d 条指令 → 命中 %d 条 (%.1f%%)，孤立 %d 条 (%.1f%%)" % (
+        total_insn, matched_insn, 100.0 * matched_insn / max(1, total_insn),
+        leftover_n, 100.0 * leftover_n / max(1, total_insn)))
+    if blocks_n:
+        out.append("      共 %d 块，平均块长 %.2f 条指令；块长分布：%s" % (
+            blocks_n, matched_insn / blocks_n,
+            ", ".join("%d条×%d" % (k, lens[k]) for k in sorted(lens))))
+    if miss:
+        out.append("      最常见「孤立」指令（前 8）：")
+        for text, c in sorted(miss.items(), key=lambda kv: -kv[1])[:8]:
+            out.append("        ×%-4d %s" % (c, text))
+    return "\n".join(out)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="nX-U16 ROP gadget 扫描器")
+    ap.add_argument("-r", "--rom", action="append", default=[],
+                    help="ROM 文件（可重复；按顺序映射到连续 64KiB 页）")
+    ap.add_argument("--rom-dir", help="机型目录（按 model.lua 的 rom_path 载入，通常只有 rom.bin）")
+    ap.add_argument("--all-roms", action="store_true",
+                    help="把 rom2.bin/rom3.bin/… 也按顺序拼进连续页（默认关闭）")
+    ap.add_argument("--max-insns", type=int, default=8,
+                    help="gadget 中 POP PC 之前最多几条指令（默认 8）")
+    ap.add_argument("--rt", action="store_true", help="额外索引 RT 结尾的 gadget")
+    ap.add_argument("--demo", type=int, default=0, metavar="N",
+                    help="random 抽样 N 段做可行性评估（0=跳过）")
+    ap.add_argument("--demo-functions", action="store_true",
+                    help="额外对全部函数体内的直线代码段做可行性评估")
+    ap.add_argument("--demo-max-insns", type=int, default=8)
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--json", metavar="OUT", help="导出索引为 JSON")
+    args = ap.parse_args()
+
+    rom = build_rom(args)
+    print("ROM 映像：")
+    print(rom.summary())
+
+    t0 = time.time()
+    db = scan(rom, max_insns=args.max_insns, include_rt=args.rt)
+    print("\n扫描耗时 %.2f s（max_insns=%d，逐偏移含奇数地址）" % (time.time() - t0, args.max_insns))
+    print(db.report())
+
+    if args.demo:
+        print()
+        runs = sample_random(rom, args.demo, 1, args.demo_max_insns + 4, seed=args.seed)
+        print(analyze(db, runs, args.demo_max_insns,
+                      "可行性评估①：随机位置的 normal 指令流（代表「任意代码」）"))
+    if args.demo_functions:
+        print()
+        runs = sample_functions(rom, 1, args.demo_max_insns + 4)
+        print(analyze(db, runs, args.demo_max_insns,
+                      "可行性评估②：PUSH LR 函数体内的 normal 指令流（代表真实编译器产物）"))
+
+    if args.json:
+        os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
+        data = {
+            "maxInsns": args.max_insns,
+            "rom": [os.path.basename(f.path) for f in rom.files],
+            "gadgets": {code.hex().upper(): addrs for code, addrs in db.index.items()},
+        }
+        with open(args.json, "w") as fh:
+            json.dump(data, fh, separators=(",", ":"))
+        print("\n已写出 %s（%.1f MB）" % (args.json, os.path.getsize(args.json) / 1e6))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

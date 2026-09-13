@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""crop-plan —— 路线 A 的能力度量与"字节传送"合成素材扫描。
+
+    tools/crop-plan --rom-dir ~/casioemu/models/fx991cnxfVirtual
+    tools/crop-plan --rom-dir ... --targets "ADD R0, #1" "OR R0, R1"
+
+对每条目标指令，把 ROM 里所有"包含它的 gadget"分三档：
+
+* ``strict``  —— 严格档（第 2 步那套）：不含 POP、不含控制流、副作用只碰 scratch；
+* ``eqpop``   —— 放宽档：含 POP 也接受，代价是**解释器要在链上补 N 个 0 字节**
+                 （因为 gadget 里的 POP 会从链上多取数据）；不含控制流、不写内存；
+* ``no``      —— 不可用（含控制流，或写到 MEM/活跃寄存器）。
+
+同时扫描"字节传送 ``Rn ← Rm``"的合成素材：ROM 里有哪些 ``ADD/MOV/OR/XOR`` 双寄存器
+gadget，以及哪些 ``POP``/``L``/``ST`` 能提供操作数 —— 这是解锁指针与算术的单点。
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from crop.gadget import scan                        # noqa: E402
+from crop.nxu16 import decode as _dec               # noqa: E402
+from crop.planner import DEFAULT_SCRATCH, effect_of  # noqa: E402
+from crop.rom import RomImage                       # noqa: E402
+
+FUNC_OPS = ("ADD", "ADDC", "SUB", "SUBC", "AND", "OR", "XOR", "MOV", "SLL", "SRL", "SRA")
+
+
+def classify(db, addr, scratch):
+    """返回 ('strict'|'eqpop'|'no', 细节)。"""
+    g = db.rebuild(addr)
+    e = effect_of(g)
+    if e.has_flow:
+        return "no", "含控制流"
+    if "MEM" in e.clobbered() and "MEM" not in scratch:
+        return "no", "写内存"
+    extra = e.clobbered() - scratch
+    # FLAGS 在 rGCC 的码流里从不跨语句存活，视为 scratch
+    extra.discard("FLAGS")
+    if e.has_pop:
+        return "eqpop", "额外链上 %d 字节；副作用 %s" % (g.chain_in - 4,
+                                                    ",".join(sorted(extra)) or "无")
+    if extra:
+        return "no", "副作用越界：%s" % ",".join(sorted(extra))
+    return "strict", "副作用 %s" % (",".join(sorted(e.writes)) or "无")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="路线 A 能力度量")
+    ap.add_argument("--rom-dir", required=True)
+    ap.add_argument("--targets", nargs="*", default=[
+        "MOV R1, #0", "MOV ER0, ER14", "MOV ER0, ER4", "ADD ER0, #1", "ADD R0, #1",
+        "SUB R0, R1", "AND R0, #1", "CMP R4, #0", "MOV ER2, ER14", "ADD ER2, ER10",
+        "SUB R2, R8", "OR R0, R1", "L R0, [ER8]", "ST R2, [ER0]", "L R0, [ER0]"])
+    ap.add_argument("--show", type=int, default=2)
+    args = ap.parse_args()
+
+    rom = RomImage.auto(args.rom_dir)
+    db = scan(rom, max_insns=8)
+    scratch = set(DEFAULT_SCRATCH)
+
+    # 指令 → 包含它的 gadget
+    index = collections.defaultdict(list)
+    for addr in sorted(db.by_addr):
+        g = db.by_addr[addr]
+        if g.ninsn == 0 or g.term != "pop_pc":
+            continue
+        for ins in db.rebuild(addr).insns:
+            if ins.cls != "term_pop_pc":
+                index[ins.text].append(addr)
+
+    print("%-20s %6s %8s %8s %6s" % ("目标指令", "候选", "strict", "eqpop", "不可用"))
+    tot = collections.Counter()
+    examples = {}
+    for t in args.targets:
+        c = collections.Counter()
+        for a in index.get(t, ()):
+            k, why = classify(db, a, scratch)
+            c[k] += 1
+            if k in ("eqpop", "strict") and (t, k) not in examples:
+                examples[(t, k)] = (a, why)
+        print("%-20s %6d %8d %8d %6d" % (t, len(index.get(t, ())), c["strict"],
+                                         c["eqpop"], c["no"]))
+        tot.update(c)
+    n = sum(tot.values())
+    print("\n合计候选 %d：strict %d (%.1f%%)，eqpop %d (%.1f%%)，不可用 %d (%.1f%%)" % (
+        n, tot["strict"], 100 * tot["strict"] / max(1, n),
+        tot["eqpop"], 100 * tot["eqpop"] / max(1, n),
+        tot["no"], 100 * tot["no"] / max(1, n)))
+
+    if args.show:
+        print("\n放宽档示例（1 个链槽 + 链上补零）：")
+        for (t, k), (a, why) in list(examples.items())[:args.show * 3]:
+            g = db.rebuild(a)
+            print("  %-18s %s @%05X  %s" % (t, k, a, why))
+            print("        %s" % " ; ".join(i.text for i in g.insns))
+
+    print("\n字节传送素材（合成 ``Rn ← Rm`` 用）：")
+    for op in FUNC_OPS:
+        forms = collections.Counter()
+        for addr in sorted(db.by_addr):
+            g = db.by_addr[addr]
+            if not g.inline_safe or g.ninsn != 1:
+                continue
+            ins = db.rebuild(addr).insns[0]
+            if ins.mnemonic == op and "," in ins.operands and "#" not in ins.operands:
+                forms[ins.text] += 1
+        if forms:
+            print("  %-5s %s" % (op, "  ".join("%s×%d" % (k, v) for k, v in forms.most_common(8))))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

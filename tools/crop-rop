@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""crop-rop —— CROP 的 ROP 解释器：`.bin`（nX-U16 机器码）→ `Rop.bin`（ROP 链）。
+
+用法：
+    tools/crop-rop --rom-dir ~/casioemu/models/fx991cnxfVirtual -i prog.bin -o out/Rop.bin
+    tools/crop-rop -r rom.bin --vocab                        # 只打印 ROP 词表
+    tools/crop-rop -r rom.bin -i prog.bin --dsl out/prog.rop # 同时导出 RopIDE 可打开的 .rop
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from crop.gadget import scan                      # noqa: E402
+from crop.interp import Options, translate        # noqa: E402
+from crop.rom import RomImage                     # noqa: E402
+from crop.ropdsl import save_rop_file             # noqa: E402
+from crop.vocab import find_pivots, find_pop_gadgets, mine_vocabulary, vocab_report  # noqa: E402
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="CROP ROP 解释器（.bin → Rop.bin）")
+    ap.add_argument("-r", "--rom", action="append", default=[], help="ROM 文件（可重复）")
+    ap.add_argument("--rom-dir", help="机型目录（按 model.lua 载入 rom.bin）")
+    ap.add_argument("-i", "--input", help="待翻译的 .bin")
+    ap.add_argument("-o", "--output", help="输出的 Rop.bin")
+    ap.add_argument("--dsl", help="同时导出的 RopIDE .rop 文件")
+    ap.add_argument("--max-insns", type=int, default=8, help="L1 块内最多指令数")
+    ap.add_argument("--form", choices=("right", "left"), default="right",
+                    help="gadget 槽编码形式（默认 right，与 Pixel Editor 一致）")
+    ap.add_argument("--pivot-side", choices=("left", "right"), default="left",
+                    help="链内跳转地址使用哪一侧基准（默认 left，与 Pixel Editor 一致）")
+    ap.add_argument("--vocab", action="store_true", help="打印 ROP 词表后退出")
+    ap.add_argument("--dump", action="store_true", help="打印链的 hexdump")
+    args = ap.parse_args()
+
+    if args.rom_dir:
+        rom = RomImage.auto(args.rom_dir)
+    elif args.rom:
+        rom = RomImage.from_paths(args.rom)
+    else:
+        raise SystemExit("需要 -r ROM 或 --rom-dir DIR")
+
+    db = scan(rom, max_insns=args.max_insns)
+    print("ROM：%s（%d 字节）→ 内联可用块 %d 种 / %d 个"
+          % (", ".join(os.path.basename(f.path) for f in rom.files),
+             sum(len(f.data) for f in rom.files), len(db.index), len(db)))
+
+    if args.vocab or not args.input:
+        print()
+        print(vocab_report(db))
+        print()
+        pops = find_pop_gadgets(db)
+        print("取数原语（POP <reg>）：%s" % ", ".join("%s=%d个" % (k, len(v)) for k, v in sorted(pops.items())))
+        print("栈枢轴（按跳过字节数排序，前 5）：")
+        for p in find_pivots(db)[:5]:
+            print("    @%05X  跳过 %2d 字节  %s" % (p.addr, p.skip, p.text))
+        if not args.input:
+            return 0
+
+    with open(args.input, "rb") as fh:
+        code = fh.read()
+    opts = Options(form=args.form, pivot_side=args.pivot_side, max_insns=args.max_insns)
+    res = translate(db, code, opts)
+    print()
+    print("翻译结果：")
+    print(res.report())
+    for w in res.warnings:
+        print("  ⚠ %s" % w)
+
+    if args.output:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+        with open(args.output, "wb") as fh:
+            fh.write(res.data)
+        print("已写出 %s（%d 字节链）" % (args.output, len(res.data)))
+    if args.dsl:
+        save_rop_file(args.dsl, res.rop)
+        print("已写出 %s（RopIDE 可直接打开）" % args.dsl)
+    if args.dump:
+        print()
+        print(res.dsl)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

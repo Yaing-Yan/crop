@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""rgcc —— 面向 ROP 的 C 子集编译器：`.c` → nX-U16 `.bin`（可 100% 被解释器翻译）。
+
+    tools/rgcc --rom-dir ~/casioemu/models/fx991cnxfVirtual demo.c -o out/demo.bin --asm
+    tools/rgcc --rom-dir ... demo.c -o out/demo.bin --rop out/Rop.bin --dsl out/demo.rop
+
+`--rop` 会直接接着跑解释器，把 .bin 变成 ROP 链，并打印覆盖率（必须 0 条不支持）。
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from crop.gadget import scan                      # noqa: E402
+from crop.interp import Options, translate        # noqa: E402
+from crop.rgcc import Backend, RgccError, compile_source   # noqa: E402
+from crop.rom import RomImage                     # noqa: E402
+from crop.ropdsl import save_rop_file             # noqa: E402
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="rGCC v0：C 子集 → nX-U16 .bin（ROP 友好）")
+    ap.add_argument("source", help="C 源文件")
+    ap.add_argument("--rom-dir", required=True, help="机型目录（取 rom.bin 做词表）")
+    ap.add_argument("-o", "--output", help="输出的 .bin")
+    ap.add_argument("--asm", action="store_true", help="打印汇编清单")
+    ap.add_argument("--data-base", default="D180",
+                    help="变量区起始地址，十六进制（默认 D180；0x 前缀可有可无）")
+    ap.add_argument("--rop", help="顺带跑解释器，输出 Rop.bin")
+    ap.add_argument("--dsl", help="同时导出 RopIDE .rop")
+    ap.add_argument("--max-insns", type=int, default=8)
+    ap.add_argument("--left-base", default="E000",
+                    help="链存放位置（左侧地址基准，默认 E000；避开会被输入区搬运覆盖的 E9E0）")
+    args = ap.parse_args()
+
+    rom = RomImage.auto(args.rom_dir)
+    db = scan(rom, max_insns=args.max_insns)
+    try:
+        backend = Backend(db)
+    except RgccError as e:
+        print("后端不可用：%s" % e)
+        return 2
+    print("后端（全部从 ROM 推导）：%s" % backend.describe())
+
+    with open(args.source, encoding="utf-8") as fh:
+        src = fh.read()
+    try:
+        base = (int(args.data_base, 16) if not args.data_base.lower().startswith("0x")
+                else int(args.data_base, 16))
+        cu = compile_source(src, backend, data_base=base)
+    except RgccError as e:
+        print("编译失败：%s" % e)
+        return 1
+
+    print("变量：%s" % ", ".join("%s@%04X" % (v.name, v.addr) for v in cu.vars.values()))
+    if args.asm:
+        print()
+        print(cu.listing)
+    print(".bin：%d 字节   %s" % (len(cu.code), cu.code.hex(" ").upper()))
+    print("✓ 每条指令都有等价 gadget（覆盖率是构造性保证）")
+
+    if args.output:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+        with open(args.output, "wb") as fh:
+            fh.write(cu.code)
+        print("已写出 %s" % args.output)
+
+    if args.rop or args.dsl:
+        lb = int(args.left_base, 16) if not args.left_base.lower().startswith("0x") \
+            else int(args.left_base, 16)
+        res = translate(db, cu.code, Options(max_insns=args.max_insns, left_base=lb))
+        print()
+        print(res.report())
+        for w in res.warnings:
+            print("  ⚠ %s" % w)
+        if args.rop:
+            os.makedirs(os.path.dirname(os.path.abspath(args.rop)), exist_ok=True)
+            with open(args.rop, "wb") as fh:
+                fh.write(res.data)
+            print("已写出 %s（%d 字节链）" % (args.rop, len(res.data)))
+        if args.dsl:
+            save_rop_file(args.dsl, res.rop)
+            print("已写出 %s（RopIDE 可直接打开）" % args.dsl)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

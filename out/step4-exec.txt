@@ -1,0 +1,2 @@
+直线: .bin=16 字节  链=28 字节  执行 steps=4 stopped=True(哨兵 BRK)  D180=7 D181=9
+死循环: .bin=36 字节  链=62 字节  执行 steps=2000 stopped=False(达到步数上限)  D180=0 D181=255

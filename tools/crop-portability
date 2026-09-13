@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""crop-portability —— 跨版本可移植性审计。
+
+对每个机型/版本目录，检查"流水线依赖的原语"能否**从该 ROM 自动推出来**，
+并打印推导结果。任何一项标 MISSING，就说明那一步有硬编码、换 Ver 会断。
+
+    tools/crop-portability ~/casioemu/models/fx991cnxfVirtual ~/casioemu/models/fx991cnxVirtual ...
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+from typing import Dict, List, Optional, Tuple
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from crop.gadget import scan                                  # noqa: E402
+from crop.nxu16 import decode as _dec                         # noqa: E402
+from crop.rom import RomImage                                 # noqa: E402
+from crop.vocab import find_pivots, find_pop_gadgets, is_clean_pivot  # noqa: E402
+
+
+def derive(db, rom) -> Dict[str, object]:
+    """从 ROM 自动推导所有流水线需要的原语。"""
+    out: Dict[str, object] = {}
+    pops = find_pop_gadgets(db)
+    out["pops"] = sorted(pops.keys())
+
+    # 1) 写一个字节到 [ER0]：ST R2,[ER0]（按"指令文本"找，不写死字节）
+    store = [a for a in sorted(db.by_addr)
+             if db.by_addr[a].inline_safe and db.by_addr[a].ninsn == 1
+             and db.rebuild(a).insns[0].text == "ST R2, [ER0]"]
+    load = [a for a in sorted(db.by_addr)
+            if db.by_addr[a].inline_safe and db.by_addr[a].ninsn == 1
+            and db.rebuild(a).insns[0].text == "L R0, [ER0]"]
+    out["st_r2_er0"] = store
+    out["ld_r0_er0"] = load
+
+    # 2) 变量槽：同时有 L 与 ST 的 (寄存器, 偏移, 基址)
+    slots: Dict[Tuple[str, str, str], List[int]] = {}
+    for a in sorted(db.by_addr):
+        g = db.by_addr[a]
+        if not g.inline_safe or g.ninsn != 1:
+            continue
+        ins = db.rebuild(a).insns[0]
+        m = re.match(r"^([A-Z0-9]+), (-?[0-9A-F]+h)\[(\w+)\]$", ins.text.replace("L ", "L ").strip())
+        if not m:
+            continue
+        reg, off, base = m.groups()
+        key = (reg, off, base)
+        slots.setdefault(key, []).append((ins.mnemonic, a))
+    both = {k: v for k, v in slots.items()
+            if {m for m, _ in v} >= {"L", "ST"}}
+    out["slots"] = {k: sorted({a for m, a in v}) for k, v in both.items()}
+
+    # 3) 干净枢轴（能续链的 MOV SP,ERn）：最省的一个 + 它枢轴后跳过的字节数
+    clean = [p for p in find_pivots(db) if is_clean_pivot(p)]
+    out["pivots"] = clean
+    out["pivot_best"] = clean[0] if clean else None
+    return out
+
+
+def launcher_for(best, left_addr: int = 0xE9E0) -> Optional[bytes]:
+    """用推导出来的枢轴生成 launcher 字节（不写死任何 ROM 地址）。"""
+    if best is None:
+        return None
+    pc = best.addr & 0xFFFF
+    csr = best.addr >> 16
+    # 实测配方：PC 写成「入口+1」（CPU 取指按 2 字节对齐），CSR 高位带 0x40
+    v = (left_addr - best.skip) & 0xFFFF
+    return bytes([0xFD, 0x24, v & 0xFF, v >> 8,
+                  (pc + 1) & 0xFF, ((pc + 1) >> 8) & 0xFF, 0x40 | (csr & 0x0F)])
+
+
+def main() -> int:
+    dirs = sys.argv[1:] or [os.path.expanduser("~/casioemu/models/fx991cnxfVirtual")]
+    print("%-24s %-8s %-22s %-26s %s" % ("ROM", "自增等", "写字节原语", "变量槽(L+ST)", "最省枢轴"))
+    for d in dirs:
+        rom = RomImage.auto(d)
+        db = scan(rom, max_insns=8)
+        r = derive(db, rom)
+        name = os.path.basename(os.path.dirname(os.path.abspath(d))) + "/" + os.path.basename(d.rstrip("/"))
+        store = "有 @%05X" % r["st_r2_er0"][0] if r["st_r2_er0"] else "**无**"
+        slots = r["slots"]
+        sl = ("%d 个 e.g. %s" % (len(slots), list(slots)[0][0] + "@" + list(slots)[0][1])) if slots else "**无**"
+        best = r["pivot_best"]
+        piv = ("@%05X skip=%d" % (best.addr, best.skip)) if best else "**无**"
+        print("%-24s %-8s %-22s %-26s %s" % (name, len(r["pops"]), store, sl, piv))
+        if best:
+            la = launcher_for(best)
+            print("%-24s launcher(自动推导) = %s" % ("", la.hex(" ").upper()))
+            if os.path.basename(d.rstrip("/")) == "fx991cnxfVirtual":
+                print("%-24s launcher(真机实测) = FD 24 D0 E9 8F 23 42   %s" % (
+                    "", "✓ 一致" if la == bytes.fromhex("FD24D0E98F2342") else "✗ 不一致"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
