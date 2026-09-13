@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""crop-labels —— 解析/校验/生成 ROM 标签表（不硬编码地址）。
+
+    tools/crop-labels --rom-dir DIR                       # 打印解析结果
+    tools/crop-labels --rom-dir DIR --header include/romlabels.h --ver verf
+"""
+from __future__ import annotations
+import argparse, os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from crop.labels import LabelTable, gen_header, load_labels   # noqa: E402
+from crop.rom import RomImage                                 # noqa: E402
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--rom-dir", required=True)
+    ap.add_argument("--conf", default=os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "labels.conf"))
+    ap.add_argument("--header")
+    ap.add_argument("--ver", default="unknown")
+    a = ap.parse_args()
+    rom = RomImage.auto(a.rom_dir)
+    tbl = LabelTable(load_labels(a.conf), rom)
+    print("ROM: %s" % ", ".join(os.path.basename(f.path) for f in rom.files))
+    print(tbl.report())
+    if a.header:
+        os.makedirs(os.path.dirname(os.path.abspath(a.header)), exist_ok=True)
+        open(a.header, "w").write(gen_header(tbl, a.ver))
+        print("\n已生成 %s" % a.header)
+    return 0 if not tbl.missing else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
