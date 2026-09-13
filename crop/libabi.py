@@ -71,6 +71,8 @@ LIBFUNCS: Tuple[LibFunc, ...] = (
             "把屏幕缓冲区刷新到显存（并提交）"),
     LibFunc("rclear", "clear", (),
             "清空屏幕缓冲区"),
+    LibFunc("rscreen_on", "screen-on", (),
+            "开启屏幕显示（**不先调它的话，画进屏幕缓冲区的东西不会显示出来**）"),
 )
 
 
