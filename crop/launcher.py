@@ -104,7 +104,9 @@ class LauncherConfig:
     left_addr: int = 0xE9E0
     right_addr: int = 0xD3C0
     data_base: int = 0xD180
-    launcher_addr: int = DEFAULT_LAUNCHER_ADDR
+    launcher_addr: int = 0xD248          # 回放区＝输入缓冲区（源）；写 0xD180 会被"按右"覆盖
+    len_field: int = 0xD244              # 输入长度/光标账本（不写它，按右不会导入）
+    len_value: int = 7                   # 账本值 = launcher 字节数
     history_addr: int = 0xFC00          # 链在左地址处可能被覆盖时用的备用区
     keys: str = "→ 然后 ="              # 触发按键序列
 
@@ -121,7 +123,10 @@ def parse_conf(text: str) -> LauncherConfig:
             continue
         k, _, v = line.partition("=")
         k, v = k.strip(), v.strip()
-        if k in ("left_addr", "right_addr", "data_base", "launcher_addr", "history_addr"):
+        if k in ("left_addr", "right_addr", "data_base", "launcher_addr",
+                 "history_addr", "len_field"):
+            setattr(cfg, k, int(v, 16))
+        elif k == "len_value":
             setattr(cfg, k, int(v, 16))
         elif k == "keys":
             cfg.keys = v
