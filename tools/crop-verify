@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""crop-verify —— 真机（CasioEmuMsvc + McpPlugin）端到端验证：注入 → 按键 → 读回。
+
+一条命令做完整个"注入规程"（见 `docs/注入规程.md`）：
+
+1. 按 AC 清输入行；
+2. 清 `0xD180`（输入区），把**链**写到左地址（默认 `0xEC00`）；
+3. 把 **launcher** 写到回放区（`0xD248`）并写长度账本（`0xD244 = 07`）；
+4. 长按【→】再长按【=】触发；
+5. 读回数据区 / 屏幕缓冲区，把屏幕缓冲区**解码成点阵**打印出来（像素级证据）。
+
+    tools/crop-verify --rom-dir ~/casioemu/models/fx991cnxfVirtual \
+        --bin out/hello.bin --data-base D700 --expect D137=0E --screen
+
+没有 MCP 时加 `--dry-run`：只生成并打印注入字节，不碰机器。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from crop.gadget import scan                    # noqa: E402
+from crop.launcher import LauncherConfig, parse_conf   # noqa: E402
+from crop.rom import RomImage                   # noqa: E402
+
+HOST, PORT = "127.0.0.1", 3001
+
+KEY_AC, KEY_RIGHT, KEY_EQ = 0x42, 0x37, 0x30
+HOLD_S = 1.0            # MCP 按键必须长按 ≥0.9s，否则键盘扫描会漏掉
+
+
+# ------------------------------------------------------------------ MCP
+def rpc(tool: str, args: dict, host: str = HOST, port: int = PORT) -> str:
+    req = urllib.request.Request(
+        "http://%s:%d/mcp" % (host, port),
+        data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                         "params": {"name": tool, "arguments": args}}).encode(),
+        headers={"Content-Type": "application/json",
+                 "Accept": "application/json, text/event-stream"})
+    with urllib.request.urlopen(req, timeout=30) as fh:
+        body = fh.read().decode()
+    if body.lstrip().startswith(("event:", "data:")):
+        for line in body.splitlines():
+            if line.startswith("data:"):
+                body = line[5:].strip()
+    d = json.loads(body)
+    res = d.get("result", d)
+    if isinstance(res, dict) and "content" in res:
+        return "\n".join(c.get("text", "") for c in res["content"])
+    return json.dumps(res, ensure_ascii=False)[:2000]
+
+
+def write_mem(addr: int, data: bytes, **kw) -> str:
+    return rpc("write_memory", {"address": addr, "bytes": list(data)}, **kw)
+
+
+def read_mem(addr: int, size: int, **kw) -> bytes:
+    txt = rpc("read_memory", {"address": addr, "size": size}, **kw)
+    hexes = []
+    for tok in txt.replace(",", " ").split():
+        tok = tok.strip("[](){}").lstrip("0x").rstrip("hH")
+        if len(tok) == 2 and all(c in "0123456789abcdefABCDEF" for c in tok):
+            hexes.append(int(tok, 16))
+    if len(hexes) < size:
+        raise RuntimeError("read_memory 只回读了 %d 字节（要 %d）：%s" % (len(hexes), size, txt[:200]))
+    return bytes(hexes[:size])
+
+
+def tap(code: int, hold: float = HOLD_S, **kw) -> None:
+    rpc("keyboard_code", {"code": code, "pressed": True}, **kw)
+    time.sleep(hold)
+    rpc("keyboard_code", {"code": code, "pressed": False}, **kw)
+    time.sleep(0.3)
+
+
+# ------------------------------------------------------------------ 屏幕解码
+def render_screen(buf: bytes, base: int, w: int = 192, rows: int = 32, stride: int = 24) -> str:
+    """把屏幕缓冲区解码成点阵字符画（每字节 = 纵向 8 像素，行距 24 字节 = 192/8）。"""
+    out = []
+    for y in range(rows):
+        line = []
+        for x in range(w):
+            i = y * stride + (x >> 3)
+            line.append("#" if i < len(buf) and (buf[i] >> (x & 7)) & 1 else ".")
+        s = "".join(line).rstrip(".")
+        if "#" in s:
+            out.append("%3d|%s|" % (base + y * stride, s))
+    return "\n".join(out) if out else "（该区域没有任何点亮的像素）"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="CROP 真机端到端验证（MCP）")
+    ap.add_argument("--rom-dir", required=True)
+    ap.add_argument("--bin", required=True, help="rGCC 产出的 .bin（会被就地翻译成链）")
+    ap.add_argument("--conf", default="launcher.conf")
+    ap.add_argument("--left-base", default=None, help="链地址（默认取 launcher.conf）")
+    ap.add_argument("--data-base", default=None, help="变量区基址（十六进制）")
+    ap.add_argument("--expect", action="append", default=[],
+                    help="期望的内存值，形如 D700=00 或 D710=11,45,14")
+    ap.add_argument("--screen", nargs="*", default=[], type=lambda s: int(s, 16),
+                    help="要解码的屏幕缓冲区地址（默认 DDD4）")
+    ap.add_argument("--host", default=HOST)
+    ap.add_argument("--port", type=int, default=PORT)
+    ap.add_argument("--dry-run", action="store_true", help="只生成注入字节，不连机器")
+    args = ap.parse_args()
+    kw = {"host": args.host, "port": args.port}
+
+    rom = RomImage.auto(args.rom_dir)
+    db = scan(rom, max_insns=8)
+    conf = parse_conf(open(args.conf, encoding="utf-8").read())
+    if args.left_base:
+        conf.left_addr = int(args.left_base, 16)
+    data_base = int(args.data_base, 16) if args.data_base else conf.data_base
+
+    from crop.interp import Options, translate
+    from crop.labels import LabelTable, load_labels
+    from crop.libabi import Library
+    from crop.rom import RomImage as _R      # noqa: F401
+    from crop.routines import find_rt_push
+    from crop.rgcc import Backend, compile_source, verify_translatable
+
+    be = Backend(db)
+    lib = Library(be, rom, LabelTable(load_labels("labels.conf"), rom))
+    code = open(args.bin, "rb").read()
+    verify_translatable(code, db, routines=tuple(lib.routines.values()))
+    opts = Options(left_base=conf.left_addr, routines=tuple(lib.routines.values()),
+                   rt_push=lib.rt_push)
+    res = translate(db, code, opts)
+    chain = res.data
+    launcher = conf.launcher()
+    print("链 %d 字节 → %04X；launcher %d 字节 → %04X；账本 %04X = %02X"
+          % (len(chain), conf.left_addr, len(launcher), conf.launcher_addr,
+             conf.len_field, conf.len_value))
+    print(res.report())
+    if res.stats["unsupported"]:
+        print("✗ 有无法翻译的指令，拒绝注入")
+        return 1
+
+    print("注入计划：")
+    print("  [%04X] %s   ← 链" % (conf.left_addr, chain.hex(" ").upper()))
+    print("  [%04X] %s   ← launcher" % (conf.launcher_addr, launcher.hex(" ").upper()))
+    print("  [%04X] %s   ← 长度账本" % (conf.len_field,
+                                        bytes([conf.len_value] * 4).hex(" ").upper()))
+    if args.dry_run:
+        return 0
+
+    print("\n--- 注入 ---")
+    rpc("write_memory", {"address": conf.left_addr, "bytes": list(chain)}, **kw)
+    zeros = bytes(0x40)
+    rpc("write_memory", {"address": 0xD180, "bytes": list(zeros)}, **kw)
+    rpc("write_memory", {"address": conf.launcher_addr, "bytes": list(launcher)}, **kw)
+    rpc("write_memory", {"address": conf.len_field,
+                         "bytes": [conf.len_value] * 4}, **kw)
+    back = read_mem(conf.left_addr, len(chain), **kw)
+    print("链回读%s" % ("一致 ✓" if back == chain else "不一致 ✗"))
+
+    print("--- 按键：AC → [→] → [=]（长按 %.1fs）---" % HOLD_S)
+    tap(KEY_AC, **kw)
+    tap(KEY_RIGHT, **kw)
+    tap(KEY_EQ, **kw)
+
+    print("\n--- 读回 ---")
+    ok = True
+    for spec in args.expect:
+        a_s, _, v_s = spec.partition("=")
+        addr = int(a_s, 16)
+        want = bytes(int(t, 16) for t in v_s.replace(",", " ").split())
+        got = read_mem(addr, len(want), **kw)
+        good = got == want
+        ok = ok and good
+        print("  [%04X] 期望 %s  实际 %s  %s" % (
+            addr, want.hex(" ").upper(), got.hex(" ").upper(), "✓" if good else "✗"))
+
+    for base in (args.screen or [0xDDD4]):
+        buf = read_mem(base, 0x600, **kw)
+        print("\n屏幕缓冲区 %04X 解码（%.0f%% 非零字节）：" % (
+            base, 100.0 * sum(1 for b in buf if b) / len(buf)))
+        print(render_screen(buf, base))
+    if data_base:
+        pass
+    return 0 if ok else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

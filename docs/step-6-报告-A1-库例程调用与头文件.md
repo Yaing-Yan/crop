@@ -1,0 +1,210 @@
+# 第 6 步报告：库例程调用（A1）+ 头文件（B1）+ 预处理器（A6）
+
+> 用户的原话要求：
+> 「函数、数组、结构体、头文件快点弄出来吧」「README 用 english」
+> 「先写头文件 rstdio.h rstdlib.h rstring.h」
+> 「显示文本 221BE（r0=字体大小 0E/0A/08；r1=高度；er2=地址）转写为 C 封装」
+> 「08772 刷新 DDD4→显存、07F6C 清空 DDD4 也封装」
+> 「对于这些 gadgets，我们研究 VerF 的 ROM，然后用 **C 转写**而不是直接调用这些 gadgets」
+> 「显示文本的不能依赖寄存器了，而是用变量」「C 中体现为变量，rop 巧妙还回寄存器 / 函数参数」
+
+本步交付：**A1 库例程调用机制** + **B1 `include/rstdio.h`** + **A6 预处理器** +
+`examples/hello.c`，并给出"哪些已确证、哪些还没确证"的诚实清单。
+
+---
+
+## 一、先把 VerF 的三个例程读明白（反汇编结论）
+
+### 1. `print-line` @ `0x221BE`（用户给的显示文本入口）
+
+```
+221B8  PUSH LR
+221BA  MOV  R1, R0          ← 另一入口：R0=行号、字体固定 14
+221BC  MOV  R0, #14
+221BE  ST   R0, 0D137h      ← ★ 用户指定的入口：把"字体大小"写进全局 0D137
+221C2  BL   08288h          ← 真正的渲染器
+221C6  POP  PC              ← 从 ROP 链取下一个槽（不需要 rt-fix）
+```
+
+* 入口处的寄存器契约：**`R0` = 字体大小（0x0E/0x0A/0x08，同时被当作起始 x 像素）**、
+  **`R1` = 纵向像素（渲染器里 `CMP R1,#64`，即 0..63）**、**`ER2` = 以 0 结尾的字符串地址**。
+* 渲染器 `0x8288` 里 `MOV ER8,ER0` → `R8`=x、`R9`=y；`MOV R13,#11`（字体 14 时字宽 11），
+  字体 ≠14 时字宽 6。
+* **它以 `POP PC` 结尾**（不是 `RT`），所以链里只要放一个槽就能调用，
+  例程自己的 `POP PC` 会取走链上的下一个槽 —— 整条链仍是均匀的 4 字节槽。
+
+#### 重要发现：渲染器有**两个绘制缓冲页**，由 `[0xD139]` 选择
+
+`0x8362` 的字形例程：
+
+```
+837E  MOV R3, #24          ← 行距 24 字节（192 像素 ÷ 8）
+8380  MOV R4, #211 / MOV R5, #227    → ER4 = 0xE3D3
+8384  L   R7, 0D139h
+8388  BC  NE, 838Eh
+838A  MOV R4, #211 / MOV R5, #233    → ER4 = 0xE9D3（0xD139 == 0 时）
+838E  ST  R3, -01h[FP] / ST ER4, -04h[FP]
+```
+
+即：
+
+| `[0xD139]` | 绘制缓冲 | 与 `rrefresh`（0x8772）的关系 |
+|---|---|---|
+| `≠ 0` | `0xDDD4 ~ 0xE3D3` | 0x8772 正是把这一段刷到显存 |
+| `= 0`   | `0xE3D4 ~ 0xE9D3` | ROM 里 `0x8764` 那个孪生例程刷的是这一段 |
+
+所以"`rprint` 之后 `rrefresh` 没东西"并不是链错了，而是**画到另一页去了**。
+这解释了本步离线验证里"`rprint` 往 `0xE3D4` 写、`0xF800` 没拿到数据"的现象。
+真机上 `[0xD139]` 的值由系统 UI 决定，**必须实测确认**（见 `tools/crop-verify --screen`）。
+
+### 2. `refresh` @ `0x08772`
+
+```
+8772  PUSH XR4 / PUSH QR8
+8776  MOV R0,#212 / MOV R1,#221      → ER0 = 0xDDD4（源）
+877A  PUSH ER0
+877C  MOV R2,#0 / MOV R3,#248        → ER2 = 0xF800（显存）
+8780  MOV R0,#64                     → 64 次
+8782… 每次搬 12+12=24 字节，目标指针每次 +32
+87A6  POP ER0
+87A8  BL 0A1DEh                      ← 提交给显示控制器
+87AC  POP QR8 / 87AE POP XR4 / 87B0 POP PC
+```
+
+* 语义：**把 `0xDDD4..0xE3D3`（1536 字节）搬到显存 `0xF800`，再调一次提交例程**。
+* 同样以 `POP PC` 结尾 → 一个槽直接调。
+* `0x8764` 是同族孪生（源 = `0xE3D4`）。
+
+### 3. `clear` @ `0x07F6C`
+
+```
+7F6C  PUSH QR8
+7F6E  MOV ER8,#0 / ER10,#0 / ER12,#0 / ER14,#0
+7F76  LEA 0DDD4h
+7F7A  MOV R0,#192
+7F7C  ST QR8,[EA+]  / ADD ER0,#255 / BC NE, 07F7Ch      ← 192 × 8 = 1536 字节清零
+7F82  POP QR8
+7F84  RT                       ← ★ 硬件返回栈！
+```
+
+* 语义：**把 `0xDDD4..0xE3D3` 全部清零**。
+* **以 `RT` 结尾**：`RT` 弹的是**硬件返回栈**（`nxu16_lift.py`：`m.csr, m.pc = m.rstack.pop()`），
+  与 ROP 链无关，因此必须先往硬件返回栈里放一条"回来后继续吃链"的记录。
+
+## 二、A1：ROM 例程当链原语（rt-fix 的真正契约）
+
+`crop/routines.py` 扫描 ROM 自动发现 **rt-fix 原语**，形态是：
+
+```
+A:      BL  T          ; T 处是一条 POP PC（先把返回地址压进硬件返回栈，再从链上取一个槽）
+A + 4:  BC  AL, U      ; U 处也是一条 POP PC（例程 RT 回来后，从这里继续吃链）
+```
+
+VerF 实测：`A = 0x2BAD4`（`BL 02h:09696h`，`T = 0x29696` 正是 `POP PC`），
+`U = 0x2BA7E` 也是 `POP PC`。VerC 是 `A = 0x2B948`（`BL 0FBFEh`）。
+**两个 Ver 都能自动扫出来，代码里没有任何裸地址。**
+
+于是调用一个 `RT` 结尾的例程（如 `clear`）在链上就是**两个普通槽**：
+
+```
+[rt-fix 槽]  →  BL/POP PC 吃掉下一个槽 → 继续
+[例程入口槽] →  例程跑完 RT → 0x2BAD8(BC AL) → 0x2BA7E(POP PC) → 继续
+```
+
+离线实测的轨迹（`clear` 那次，SP 变化一并列出）：
+
+```
+step 22: 2BAD4 sp=EC54   ← rt-fix
+step 23: 29696 sp=EC54   ← POP PC 吃掉下一个槽
+step 24: 07F6C sp=EC58   ← clear 入口
+step 25: 07F7C sp=EC50   ← PUSH QR8 后进入清零循环
+step 216: 07F82 sp=EC50  ← 循环结束（192 次）
+step 217: 2BAD8 sp=EC58  ← RT 回到 trampoline
+step 218: 2BA7E sp=EC58  ← POP PC
+step 219: 1769C sp=EC5C  ← 链的下一槽（rprint 的参数搬运）
+```
+
+**链因此始终是均匀的 4 字节槽序列**，解释器不需要为 rt-fix 做特殊布局。
+
+## 三、A1 的落地方式：`C 转写` = "C 封装 + 编译器搬运参数"
+
+用户要求"用 C 转写而不是直接调用这些 gadget"。落地方案（`crop/libabi.py`）：
+
+* C 层只写**变量和函数参数**：`void rprint(unsigned char font, unsigned char row, const unsigned char *text);`
+* 编译期从**标签表**（`labels.conf`，按指令签名逐 Ver 解析）拿到例程入口，
+  把例程机器码**从该 ROM 现场读出来**写进 `.bin`（所以 `.bin` 仍是一段语义完整的 nX-U16 程序）；
+* 解释器在 `.bin` 里认出这段字节 ⇒ 发**一个链槽**（`RT` 结尾的会先补 rt-fix 槽）；
+* "把参数搬进 r0/r1/er2"由编译器负责（用户明确要求这样分工）。
+
+参数搬运原语（全部从 ROM 推导）：
+
+| C 侧 | 生成的机器码 |
+|---|---|
+| 常量 → `R0`（且下一个参数是 `R1`） | `POP ER0` + 链上 2 字节（ROM 里没有 `POP R1`） |
+| 常量 → `ER2` | `POP ER2` + 链上 2 字节 |
+| 变量 → `R0` | `POP ER12` + 基址，然后 `L R0, 00h[BP]` |
+| 变量 → `R1` | `POP ER12` + 基址，然后 `L R1, 14h[BP]` |
+| 变量 → `ER2` | **暂不支持**（ROM 里没有"BP 相对装 16 位进 ER2"的可内联槽，见 A4） |
+
+字符串常量：编译器把它们放进变量区之后的只读区（`data_base + 变量数 + 8`），
+程序开头用块写 gadget 写进去，再把地址装进 `ER2`。
+
+## 四、`include/rstdio.h`（B1）
+
+```c
+#include "rstdio.h"
+unsigned char row;
+void main(void) {
+    row = 0;
+    rclear();                        /* 0x7F6C：1536 字节清零（RT 结尾 → 自动配 rt-fix） */
+    rprint(FONT_NORMAL, row, "HELLO CROP");   /* 0x221BE：R1 来自变量 */
+    rrefresh();                      /* 0x08772：0xDDD4 → 0xF800 + 提交 */
+    while (1) { }
+}
+```
+
+* `SCREEN_BUF 0xDDD4`、`SCREEN_BYTES 0x0600`、`FONT_NORMAL/SMALL/TABLE = 0x0E/0x0A/0x08`、
+  `SCREEN_H 64`；
+* 三个函数的原型写在头文件里（A6 的 `#include` 直接支持），**地址一个都没写死**。
+
+## 五、A6 预处理器（`crop/preproc.py`）
+
+`#include "x.h"` / `<x.h>`（按 `-I` 目录查、同一文件只展开一次）、`#define NAME 值`（对象式宏）、
+`#ifndef/#ifdef/#else/#endif`（够写 include guard）、`#pragma once`；
+其它指令（`#error`、`#undef`…）**明确报错**，不静默忽略。
+
+## 六、验证状态（诚实清单）
+
+| 项 | 手段 | 结论 |
+|---|---|---|
+| 例程体抽取（入口→结尾整段） | 与 ROM 字节逐字节比对 | ✅ 两个 Ver 全通过 |
+| rt-fix 原语扫描 | 两个 Ver 都扫到，且目标处确是 `POP PC` | ✅ |
+| 参数搬运（常量/变量） | 单测检查生成的机器码形态 | ✅ |
+| 整程序翻译 | `unsupported == 0`，DSL 与字节交叉校验 | ✅ 128 字节链、16 块、4 次例程调用 |
+| **`rclear` 语义** | 真 ROM 的 lifted 模拟器：先写 `FF AA AA AA 55 55` → 调 `rclear` → 读回 `00 00 00 00 00 00`，链干净停机 | ✅ **语义级确证**（同时证明 rt-fix 回路正确） |
+| `rprint` / `rrefresh` 像素级 | lifted 模拟器把 `0xF000+` 当 IO 窗口（`memwr` 被 stub），提交例程会空转；渲染器深处还会跑飞（模拟器的提升精度问题） | ⚠️ **未确证**，需真机 |
+| 真机端到端 | 本机 CasioEmuMsvc 的 GUI 不接收合成输入（uinput/XTest 都到不了它），`McpPlugin` 没加载 ⇒ 3001 端口没开 | ❌ 本轮没做成，已备好一条命令：`tools/crop-verify` |
+
+`tools/crop-verify` 一条命令做完整个注入规程（AC → 清 `0xD180` → 写链到 `0xEC00` →
+写 launcher 到 `0xD248` → 写账本 `0xD244=07` → 长按【→】【=】 → 读回 + 把屏幕缓冲区解码成点阵）：
+
+```bash
+tools/rgcc --rom-dir ~/casioemu/models/fx991cnxfVirtual -I include --data-base D700 \
+           examples/hello.c -o out/hello.bin --rop out/hello-Rop.bin
+tools/crop-verify --rom-dir ~/casioemu/models/fx991cnxfVirtual --bin out/hello.bin \
+                  --data-base D700 --expect D137=0E --screen DDD4 E3D4
+```
+
+（`--dry-run` 可以只打印注入计划不碰机器；MCP 起来后去掉即可。）
+
+## 七、下一步
+
+1. **函数 / 数组 / 结构体**（A2/A3/A5）：C 函数先做**单层内联**，数组先支持常量下标，
+   结构体按常量偏移落到变量区。
+2. **A4 字节传送合成**：把"变量里的 16 位地址装进 `ER2`"打通（需要 `L ER4,-06h[BP]` +
+   `MOV ER2,ER4` 这类组合槽），之后 `rprint` 就能接指针变量。
+3. **B2/B3**：`rstring.h`（`rmemcpy` 0x0875C、`rstrcpy`…）、`rstdlib.h`（`rsleep`…）——
+   用同一套 A1 机制，逐个加 `labels.conf` 签名。
+4. **README 改英文**（D1）。
+5. 真机确证 `rprint`/`rrefresh`，并确定 `[0xD139]` 的初值 ⇒ 决定 `rstdio.h` 里
+   要不要补一个"选择绘制页 / 用 `0x8764` 那个刷新例程"的接口。

@@ -16,7 +16,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from .chain import encode_gadget, encode_value
@@ -68,9 +68,17 @@ class RopRun:
     stopped: bool
     reason: str
     ram: Dict[int, int]
+    io: List[Tuple[int, int]] = field(default_factory=list)   # 0xF000 以上的 IO 写（显存等）
 
     def ram_at(self, addr: int) -> int:
         return self.ram.get(addr, -1)
+
+    def io_writes(self) -> Dict[int, int]:
+        """IO 窗口的最终值（显存 0xF800 之类只能从这里看）。"""
+        return {a: v for _s, a, v in self.io}
+
+    def io_at(self, addr: int) -> int:
+        return self.io_writes().get(addr, -1)
 
 
 def _new_machine(prog: Optional[bytes] = None, prog_page: int = 5,
@@ -117,7 +125,12 @@ def _step_until(m, max_steps: int) -> Tuple[int, bool, str]:
         if full == ((0 << 16) | BRK_ADDR):        # 链尾哨兵
             return steps, True, "哨兵 BRK"
         fn = m.get(full)
-        fn(m)
+        # 预提升的块自己写 m.pc；"按需单条提升"的块则**返回**下一条的完整地址
+        # （`make_single_src` 的 `return 0x%05x`）。两种都要接住，否则 PC 会卡死。
+        nxt = fn(m)
+        if nxt:
+            m.csr = (nxt >> 16) & 0xF
+            m.pc = nxt & 0xFFFF
         m.steps += 1
         steps += 1
         if not m.running:
@@ -151,7 +164,7 @@ def run_rop_chain(chain: bytes, left_base: int = 0xE9E0, max_steps: int = 200000
     steps, stopped, reason = _step_until(m, max_steps)
     watch = watch or []
     return RopRun(steps=steps, stopped=stopped, reason=reason,
-                  ram={a: m.data[0][a] for a in watch})
+                  ram={a: m.data[0][a] for a in watch}, io=list(m.io_log))
 
 
 def run_linear(prog: bytes, entry: int = 0, prog_page: int = 5,
@@ -165,4 +178,4 @@ def run_linear(prog: bytes, entry: int = 0, prog_page: int = 5,
     steps, stopped, reason = _step_until(m, max_steps)
     watch = watch or []
     return RopRun(steps=steps, stopped=stopped, reason=reason,
-                  ram={a: m.data[0][a] for a in watch})
+                  ram={a: m.data[0][a] for a in watch}, io=list(m.io_log))

@@ -50,6 +50,14 @@ class RgccError(Exception):
     pass
 
 
+def _parse_off(text: str) -> int:
+    """``-10h`` / ``00h`` → 有符号整数（反汇编器把 BP/FP 偏移打印成十六进制+'h'）。"""
+    t = text.strip()
+    if t.startswith("-"):
+        return -int(t[1:].rstrip("h"), 16)
+    return int(t.rstrip("h"), 16)
+
+
 # ----------------------------------------------------------------- 词表后端
 @dataclass
 class Backend:
@@ -81,6 +89,10 @@ class Backend:
     slot_load: bytes = b""
     slot_store: bytes = b""
     base_pop: bytes = b""
+    #: 取数原语：寄存器名 → (gadget 地址, 该条 POP 指令的字节)
+    pop_gad: Dict[str, Tuple[int, bytes]] = field(default_factory=dict)
+    #: 变量装载槽：寄存器名 → (偏移, ``L Rn, off[base]`` 的字节)。基址由 ``base_pop`` 装载。
+    var_load: Dict[str, Tuple[int, bytes]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._derive()
@@ -174,6 +186,25 @@ class Backend:
             raise RgccError("变量槽基址是 %s，但 ROM 里没有 POP %s" % (self.slot_base, bp_reg))
         self.base_pop = pop[1]
 
+        # ---- 取数原语表（常量 → 指定寄存器），给库函数参数搬运用 ----
+        for reg in pops:
+            got = self._single("POP %s" % reg)
+            if got:
+                self.pop_gad[reg] = (got[0], got[1])
+
+        # ---- 变量装载槽（变量 → 指定寄存器），基址与变量槽同一套（BP/FP）----
+        pat = re.compile(r"^([A-Z0-9]+), (-?[0-9A-F]+h)\[%s\]$" % re.escape(self.slot_base))
+        for addr in sorted(self.db.by_addr):
+            g = self.db.by_addr[addr]
+            if not g.inline_safe or g.ninsn != 1:
+                continue
+            ins = self.db.rebuild(addr).insns[0]
+            if ins.mnemonic != "L":
+                continue
+            m = pat.match(ins.operands)
+            if m and m.group(1) not in self.var_load:
+                self.var_load[m.group(1)] = (_parse_off(m.group(2)), ins.raw)
+
     # ---------------------------------------------------------------- 生成
     def write_byte_imm(self, addr: int, value: int) -> bytes:
         """``*(u8*)addr = value``：POP <宽寄存器>(ERn=地址, Rn+2=值) + ST Rn+2,[ERn]。
@@ -218,10 +249,12 @@ class Backend:
 
     def describe(self) -> str:
         return ("常量写内存: POP→%s + ST @%05X（内联 %d 字节）；"
-                "变量槽: %s[%s] L@%05X；基址装载 %s" % (
+                "变量槽: %s[%s] L@%05X；基址装载 %s；"
+                "变量装载槽 %s" % (
                     self.const_value_reg, self.const_store_addr, self.const_pop_len,
                     self.slot_off, self.slot_base, self.slot_load_addr,
-                    self.base_pop.hex().upper()))
+                    self.base_pop.hex().upper(),
+                    " ".join(sorted(self.var_load))))
 
     @staticmethod
     def chain_data(addr: int, value: int) -> bytes:
@@ -241,12 +274,14 @@ class Var:
 
 @dataclass
 class Stmt:
-    kind: str                  # 'assign' | 'loop'
+    kind: str                  # 'assign' | 'copy' | 'loop' | 'call'
     var: Optional[str] = None
     value: int = 0
     body: List["Stmt"] = field(default_factory=list)
     line: int = 0
     src: str = ""                      # kind == 'copy' 时的源变量
+    name: str = ""                     # kind == 'call' 时的函数名
+    args: List[Tuple[str, object]] = field(default_factory=list)
 
 
 @dataclass
@@ -257,15 +292,18 @@ class CompileUnit:
     code: bytes
     listing: List[str]
     data_base: int = 0xD180
+    strings: Dict[int, bytes] = field(default_factory=dict)
+    protos: Dict[str, int] = field(default_factory=dict)   # 声明过的库函数 → 参数个数
 
 
 _TOKEN = re.compile(r"""
     (?P<ws>\s+)
   | (?P<comment>//[^\n]*)
+  | (?P<str>"(?:[^"\\]|\\.)*")
   | (?P<num>0[xX][0-9a-fA-F]+|\d+)
   | (?P<id>[A-Za-z_]\w*)
   | (?P<op><<|>>|[-+*/%&|^~])
-  | (?P<punct>[{}();=])
+  | (?P<punct>[{}();=,])
 """, re.VERBOSE)
 
 
@@ -292,10 +330,16 @@ class Parser:
         self.i = 0
         self.vars: Dict[str, Var] = {}
         self.next_addr = data_base
+        self.protos: Dict[str, int] = {}          # 库函数原型：名字 → 参数个数
+        self.strings: List[bytes] = []            # 字符串常量池（去重）
+        self._str_ids: Dict[bytes, int] = {}
 
     # ---- 基础
     def peek(self) -> Tuple[str, str, int]:
         return self.toks[self.i]
+
+    def look(self, k: int = 1) -> Tuple[str, str, int]:
+        return self.toks[min(self.i + k, len(self.toks) - 1)]
 
     def next(self) -> Tuple[str, str, int]:
         t = self.toks[self.i]
@@ -316,8 +360,21 @@ class Parser:
 
     # ---- 语法
     def parse(self) -> Tuple[Dict[str, Var], List[Stmt]]:
-        while self.peek()[1] != "void":
-            self.parse_decl()
+        # 声明区：变量定义 + 库函数原型（来自 #include 的头文件）
+        while True:
+            kind, text, line = self.peek()
+            if text == "unsigned":
+                self.parse_decl()
+                continue
+            if text == "const":                      # `const unsigned char *p` 原型内部才允许
+                raise RgccError("第 %d 行：顶层只支持 `unsigned char 变量;` 或函数原型" % line)
+            if text == "void" and self.look(2)[1] == "(":
+                if self.look(1)[1] == "main":
+                    break
+                self.parse_proto()
+                continue
+            raise RgccError("第 %d 行：只支持 `unsigned char 变量;`、函数原型与 main()，"
+                            "实际是 %r" % (line, text))
         self.expect("void")
         fn = self.expect_kind("id")
         if fn[1] != "main":
@@ -330,6 +387,36 @@ class Parser:
         if self.peek()[0] != "eof":
             raise RgccError("第 %d 行：main() 之后还有内容" % self.peek()[2])
         return self.vars, body
+
+    def parse_proto(self) -> None:
+        """``void rprint(unsigned char font, unsigned char row, const unsigned char *text);``
+
+        参数在 C 层只作说明用 —— 真正的"哪个参数进哪个寄存器"来自库 ABI 表
+        （``crop/libabi.py``）。这里只记下参数个数，用来做调用点的个数检查。
+        """
+        line = self.peek()[2]
+        self.expect("void")
+        name = self.expect_kind("id")[1]
+        self.expect("(")
+        depth, nargs, seen = 0, 0, False
+        while True:
+            kind, text, ln = self.next()
+            if kind == "eof":
+                raise RgccError("第 %d 行：原型 %s 没有结束的 ')'" % (line, name))
+            if text == "(":
+                depth += 1
+            elif text == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif text == "," and depth == 0:
+                nargs += 1
+            elif text not in ("void",):
+                seen = True
+        if seen:
+            nargs += 1
+        self.expect(";")
+        self.protos[name] = nargs
 
     def parse_decl(self) -> None:
         line = self.peek()[2]
@@ -369,6 +456,8 @@ class Parser:
             return Stmt(kind="loop", body=self.parse_block(), line=line)
         if kind == "id":
             name = self.next()[1]
+            if self.peek()[1] == "(":                 # 函数调用语句
+                return self.parse_call(name, line)
             if name not in self.vars:
                 raise RgccError("第 %d 行：未声明的变量 %s" % (line, name))
             self.expect("=")
@@ -385,6 +474,41 @@ class Parser:
                 raise RgccError("第 %d 行：未声明的变量 %s" % (line, got.var))
             return Stmt(kind="copy", var=name, value=0, src=got.var, line=line)
         raise RgccError("第 %d 行：无法解析的语句 %r" % (line, text))
+
+    def parse_call(self, name: str, line: int) -> Stmt:
+        """``rprint(0x0E, row, "Hi");`` —— 参数只允许：常量、变量、字符串常量。"""
+        self.expect("(")
+        args: List[Tuple[str, object]] = []
+        if self.peek()[1] != ")":
+            while True:
+                kind, text, ln = self.peek()
+                if kind == "str":
+                    self.next()
+                    raw = text[1:-1]
+                    data = raw.encode("utf-8").decode("unicode_escape").encode("latin-1")
+                    if data not in self._str_ids:
+                        self._str_ids[data] = len(self.strings)
+                        self.strings.append(data)
+                    args.append(("str", self._str_ids[data]))
+                elif kind == "num":
+                    self.next()
+                    args.append(("const", int(text, 0)))
+                elif kind == "id":
+                    self.next()
+                    if text not in self.vars:
+                        raise RgccError("第 %d 行：调用 %s 时用了未声明的变量 %s"
+                                        % (ln, name, text))
+                    args.append(("var", self.vars[text].addr))
+                else:
+                    raise RgccError("第 %d 行：调用 %s 的参数只支持常量/变量/字符串，"
+                                    "实际是 %r" % (ln, name, text))
+                if self.peek()[1] == ",":
+                    self.next()
+                    continue
+                break
+        self.expect(")")
+        self.expect(";")
+        return Stmt(kind="call", name=name, args=args, line=line)
 
 
 # ----------------------------------------------------------------- 表达式
@@ -501,10 +625,23 @@ class _ExprParser:
 
 
 # ----------------------------------------------------------------- 代码生成
-def compile_source(src: str, backend: Backend, data_base: int = 0xD180) -> CompileUnit:
-    """把 C 子集源码编译成 nX-U16 机器码，并核对每条指令都有 gadget。"""
+def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
+                   lib: Optional[object] = None) -> CompileUnit:
+    """把 C 子集源码编译成 nX-U16 机器码，并核对每条指令都有 gadget。
+
+    ``lib``：``crop/libabi.py`` 的 ``Library``；给了才允许调用库函数（A1）。
+    """
     parser = Parser(src, data_base)
     vars_, body = parser.parse()
+
+    # ---- 字符串常量池：放在变量区之后（留 8 字节，避开块写的 2 字节溢出）----
+    str_addr: Dict[int, int] = {}
+    at = (data_base + len(vars_) + 8) & ~1
+    strings: Dict[int, bytes] = {}
+    for data in parser.strings:
+        str_addr[parser._str_ids[data]] = at
+        strings[at] = data + b"\x00"
+        at = (at + len(data) + 2) & ~1
 
     code = bytearray()
     listing: List[str] = []
@@ -518,10 +655,41 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180) -> Compi
         listing.append("%04X  %-11s %s" % (off, b.hex(" ").upper(), text))
         return off
 
+    # ---- 只读数据（字符串）初始化：程序一开头写进 RAM ----
+    for addr in sorted(strings):
+        data = strings[addr]
+        for off in range(0, len(data), 6):
+            chunk = data[off:off + 6]
+            emit(backend.block_write(addr + off, chunk),
+                 "字符串 [%04X] ← %s" % (addr + off, " ".join("%02X" % c for c in chunk)))
+
+    def resolve(args) -> List[Tuple[str, int]]:
+        out: List[Tuple[str, int]] = []
+        for kind, val in args:
+            out.append(("const", str_addr[val]) if kind == "str" else (kind, val))
+        return out
+
     def gen(stmts: List[Stmt]) -> None:
         i = 0
         while i < len(stmts):
             st = stmts[i]
+            # --- 库函数调用（参数搬运 + 进入 ROM 例程）---
+            if st.kind == "call":
+                if lib is None:
+                    raise RgccError("第 %d 行：调用了 %s，但编译时没给库表"
+                                    "（tools/rgcc --labels labels.conf）" % (st.line, st.name))
+                if st.name in parser.protos and parser.protos[st.name] != len(st.args):
+                    raise RgccError("第 %d 行：%s 原型里有 %d 个参数，调用给了 %d 个" % (
+                        st.line, st.name, parser.protos[st.name], len(st.args)))
+                try:
+                    body_bytes = lib.emit_call(st.name, resolve(st.args))
+                except Exception as e:            # LibError 等 → 编译错误
+                    raise RgccError("第 %d 行：调用 %s 失败：%s" % (st.line, st.name, e))
+                r = lib.routine(st.name)
+                emit(body_bytes, "%s(...);   // 搬运参数 + 例程 @%05X（%d 条指令，%s 结尾）"
+                     % (st.name, r.entry, r.ninsn, r.term))
+                i += 1
+                continue
             # --- 块写：连续的「地址相邻的常量赋值」合并成 1 次 8 字节写 ---
             if st.kind == "assign" and backend.blk_pop:
                 run = [st]
@@ -531,10 +699,15 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180) -> Compi
                        and len(run) < backend.blk_pop_len - 2):
                     run.append(stmts[j])
                     j += 1
-                if len(run) >= 3:
-                    a0 = vars_[run[0].var].addr
+                # 归并写会把 run_start+6 / +7 两个字节踩成 R8/R9：
+                # 这段范围里还住着别的变量时不能归并（否则会悄悄改掉它）。
+                a0 = vars_[run[0].var].addr
+                a_end = vars_[run[-1].var].addr
+                busy = any(a0 <= v.addr <= a0 + 7 for v in vars_.values()
+                           if not (a0 <= v.addr <= a_end))
+                if len(run) >= 3 and not busy:
                     off = emit(backend.block_write(a0, [x.value for x in run]),
-                               "块写 %04X..%04X = %s" % (a0, a0 + len(run) - 1,
+                               "块写 %04X..%04X = %s" % (a0, a_end,
                                                        " ".join("%02X" % x.value for x in run)))
                     listing.append("%04X  %-11s （POP QR%d 的内联 8 字节）" % (
                         off + 2, " ".join("%02X" % b for b in backend.block_write(
@@ -560,25 +733,27 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180) -> Compi
                 listing.append("      %s:                       // while(1) 起点 = %04X" % (labels[lid], start))
                 gen(st.body)
                 # `B csr:addr` 4 字节：[0x00][0xF0][addr_lo][addr_hi]
-                at = emit(bytes([0x00, 0xF0, 0x00, 0x00]),
-                          "B %s                  // 无条件回跳" % labels[lid])
-                fixups.append((at, lid))
+                at2 = emit(bytes([0x00, 0xF0, 0x00, 0x00]),
+                           "B %s                  // 无条件回跳" % labels[lid])
+                fixups.append((at2, lid))
             else:                                  # pragma: no cover - 防御
                 raise RgccError("未知语句 %s" % st.kind)
             i += 1
 
     gen(body)
     # 回填跳转（B 是 4 字节绝对地址：低字节在先，段号在最后）
-    for at, lid in fixups:
+    for at2, lid in fixups:
         # 目标必须落在自身代码里；段号固定 0（解释器只按 .bin 内偏移解析标签）
         target = _label_offset(listing, labels[lid])
-        code[at + 2] = target & 0xFF
-        code[at + 3] = (target >> 8) & 0xFF
+        code[at2 + 2] = target & 0xFF
+        code[at2 + 3] = (target >> 8) & 0xFF
 
     # ---- 核对：每条指令都必须有 gadget（否则"解释器覆盖 100%"不成立）
-    verify_translatable(bytes(code), backend.db)
+    routines = tuple(getattr(lib, "routines", {}).values()) if lib is not None else ()
+    verify_translatable(bytes(code), backend.db, routines=routines)
     return CompileUnit(source=src, vars=vars_, body=body, code=bytes(code),
-                       listing=listing, data_base=data_base)
+                       listing=listing, data_base=data_base, strings=strings,
+                       protos=dict(parser.protos))
 
 
 def _label_offset(listing: Sequence[str], label: str) -> int:
@@ -588,14 +763,26 @@ def _label_offset(listing: Sequence[str], label: str) -> int:
     raise RgccError("内部错误：找不到标签 %s" % label)
 
 
-def verify_translatable(code: bytes, db: GadgetDB) -> None:
+def verify_translatable(code: bytes, db: GadgetDB, routines: Sequence = ()) -> None:
     """逐**块**核对：ROM 里存在"同字节 + 后面紧跟 POP PC"的 gadget。
 
     与解释器的 L1 完全同构：贪心取最长可匹配块；取数原语（POP）按其 ``sp_delta``
     跳过内联数据；块内允许含 POP（解释器会补零）。
+
+    ``routines``：ROM 例程（``crop/routines.py``）。它们在解释器里各占一个链槽，
+    ``.bin`` 里出现的是"入口到结尾"的整段字节，所以这里也要按整段识别。
     """
+    by_code = {r.code: r for r in routines}
     a = 0
     while a + 2 <= len(code):
+        hit = None
+        for c, r in by_code.items():
+            if code.startswith(c, a):
+                hit = r
+                break
+        if hit is not None:
+            a += len(hit.code)
+            continue
         ins = _dec.decode_at(code, a)
         if ins is None:
             raise RgccError("@%04X 字节 %02X %02X 不是合法指令" % (a, code[a], code[a + 1]))

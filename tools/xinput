@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""xinput —— 用 XTest（libXtst）给 X11 窗口发指针/键盘事件（XWayland 下的救急工具）。
+
+```bash
+tools/xinput info                      # 显示 X11 root 尺寸 / 找 CasioEmuMsvc 窗口
+tools/xinput click CasioEmuMsvc 94 257 # 在窗口内相对坐标（窗口物理像素）点一下
+tools/xinput key CasioEmuMsvc Return   # 给窗口发按键
+```
+
+为什么需要它：DSH 的 computer-use 工具走 uinput，对这个 SDL/ImGui 的 X11 客户端
+**指针移动能到、按键到不了**；XTest 是 X11 自己的合成事件通道，能直接送进客户端。
+窗口内坐标 = 窗口物理像素（X11 侧尺寸），(0,0) 是窗口左上角（不含 WM 装饰）。
+"""
+
+from __future__ import annotations
+
+import ctypes
+import ctypes.util
+import sys
+import time
+
+X11 = ctypes.CDLL("libX11.so.6")
+XTST = ctypes.CDLL("libXtst.so.6")
+
+X11.XOpenDisplay.restype = ctypes.c_void_p
+X11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+X11.XDefaultRootWindow.restype = ctypes.c_ulong
+X11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+X11.XQueryTree.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                           ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+                           ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)),
+                           ctypes.POINTER(ctypes.c_uint)]
+X11.XFetchName.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_char_p)]
+X11.XGetGeometry.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+                             ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                             ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint),
+                             ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint)]
+X11.XQueryTree.restype = ctypes.c_int
+X11.XFree.argtypes = [ctypes.c_void_p]
+X11.XDefaultScreen.restype = ctypes.c_int
+X11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+X11.XTranslateCoordinates.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+                                      ctypes.c_int, ctypes.c_int,
+                                      ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                                      ctypes.POINTER(ctypes.c_ulong)]
+X11.XDisplayWidth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+X11.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
+X11.XStringToKeysym.restype = ctypes.c_ulong
+X11.XStringToKeysym.argtypes = [ctypes.c_char_p]
+X11.XKeysymToKeycode.restype = ctypes.c_ubyte
+X11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+X11.XFlush.argtypes = [ctypes.c_void_p]
+XTST.XTestFakeMotionEvent.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_ulong]
+XTST.XTestFakeButtonEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+XTST.XTestFakeKeyEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+
+
+class _Attrs(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_int), ("y", ctypes.c_int),
+                ("width", ctypes.c_int), ("height", ctypes.c_int),
+                ("border_width", ctypes.c_int), ("depth", ctypes.c_int),
+                ("visual", ctypes.c_void_p), ("root", ctypes.c_ulong),
+                ("class_", ctypes.c_int), ("bit_gravity", ctypes.c_int),
+                ("win_gravity", ctypes.c_int), ("backing_store", ctypes.c_int),
+                ("backing_planes", ctypes.c_ulong), ("backing_pixel", ctypes.c_ulong),
+                ("save_under", ctypes.c_int), ("colormap", ctypes.c_ulong),
+                ("map_installed", ctypes.c_int), ("map_state", ctypes.c_int),
+                ("all_event_masks", ctypes.c_long), ("your_event_mask", ctypes.c_long),
+                ("do_not_propagate_mask", ctypes.c_long), ("override_redirect", ctypes.c_int),
+                ("screen", ctypes.c_void_p)]
+
+
+def open_display(name: str = ":0"):
+    d = X11.XOpenDisplay(name.encode())
+    if not d:
+        raise SystemExit("打不开 X display %s" % name)
+    return d
+
+
+def _name(d, w) -> str:
+    p = ctypes.c_char_p()
+    if X11.XFetchName(d, w, ctypes.byref(p)) and p.value:
+        return p.value.decode(errors="replace")
+    return ""
+
+
+def find_window(d, match: str):
+    """广度优先找第一个标题/类名含 ``match`` 的窗口，返回 (id, 名字)。"""
+    root = X11.XDefaultRootWindow(d)
+    queue = [root]
+    while queue:
+        w = queue.pop(0)
+        nm = _name(d, w)
+        if match.lower() in nm.lower():
+            return w, nm
+        r, parent = ctypes.c_ulong(), ctypes.c_ulong()
+        kids = ctypes.POINTER(ctypes.c_ulong)()
+        n = ctypes.c_uint()
+        if X11.XQueryTree(d, w, ctypes.byref(r), ctypes.byref(parent),
+                          ctypes.byref(kids), ctypes.byref(n)):
+            for k in range(n.value):
+                queue.append(kids[k])
+            if kids:
+                X11.XFree(kids)
+    return None, ""
+
+
+def window_box(d, w):
+    """窗口在 root 上的位置与尺寸（X11 物理像素）。"""
+    root_r, x_r, y_r = ctypes.c_ulong(), ctypes.c_int(), ctypes.c_int()
+    w_r, h_r, bw_r, depth_r = (ctypes.c_uint(), ctypes.c_uint(),
+                               ctypes.c_uint(), ctypes.c_uint())
+    if not X11.XGetGeometry(d, w, ctypes.byref(root_r), ctypes.byref(x_r), ctypes.byref(y_r),
+                            ctypes.byref(w_r), ctypes.byref(h_r),
+                            ctypes.byref(bw_r), ctypes.byref(depth_r)):
+        raise SystemExit("XGetGeometry 失败")
+    rx, ry = ctypes.c_int(), ctypes.c_int()
+    child = ctypes.c_ulong()
+    X11.XTranslateCoordinates(d, w, X11.XDefaultRootWindow(d), 0, 0,
+                              ctypes.byref(rx), ctypes.byref(ry), ctypes.byref(child))
+    return rx.value, ry.value, w_r.value, h_r.value
+
+
+def main() -> int:
+    disp = ":0"
+    argv = [a for a in sys.argv[1:]]
+    if argv and argv[0] == "--display":
+        disp = argv[1]
+        argv = argv[2:]
+    d = open_display(disp)
+    root = X11.XDefaultRootWindow(d)
+    scr = X11.XDefaultScreen(d)
+    cmd = argv[0] if argv else "info"
+
+    if cmd == "info":
+        print("X11 %s root=%dx%d" % (disp, X11.XDisplayWidth(d, scr), X11.XDisplayHeight(d, scr)))
+        for name in ("CasioEmuMsvc",):
+            w, nm = find_window(d, name)
+            if w:
+                print("  窗口 %-14s id=0x%X box=%s" % (nm, w, window_box(d, w)))
+            else:
+                print("  找不到 %s" % name)
+        return 0
+
+    match, box_args = argv[1], argv[2:]
+    w, nm = find_window(d, match)
+    if not w:
+        raise SystemExit("找不到窗口 %r" % match)
+    wx, wy, ww, wh = window_box(d, w)
+    if cmd == "click":
+        x, y = int(box_args[0]), int(box_args[1])
+        XTST.XTestFakeMotionEvent(d, -1, wx + x, wy + y, 0)
+        X11.XFlush(d)
+        time.sleep(0.15)
+        XTST.XTestFakeButtonEvent(d, 1, 1, 0)
+        X11.XFlush(d)
+        time.sleep(0.12)
+        XTST.XTestFakeButtonEvent(d, 1, 0, 0)
+        X11.XFlush(d)
+        print("click %s(%d,%d) → root(%d,%d)" % (nm, x, y, wx + x, wy + y))
+    elif cmd == "move":
+        x, y = int(box_args[0]), int(box_args[1])
+        XTST.XTestFakeMotionEvent(d, -1, wx + x, wy + y, 0)
+        X11.XFlush(d)
+        print("move → root(%d,%d)" % (wx + x, wy + y))
+    elif cmd == "key":
+        keys = box_args[0].split("+")
+        codes = []
+        for k in keys:
+            ks = X11.XStringToKeysym(k.encode())
+            kc = X11.XKeysymToKeycode(d, ks)
+            if not kc:
+                raise SystemExit("未知按键 %r" % k)
+            codes.append(kc)
+        for kc in codes:
+            XTST.XTestFakeKeyEvent(d, kc, 1, 0)
+        X11.XFlush(d)
+        time.sleep(0.05)
+        for kc in reversed(codes):
+            XTST.XTestFakeKeyEvent(d, kc, 0, 0)
+        X11.XFlush(d)
+        print("key %s" % box_args[0])
+    else:
+        raise SystemExit("未知命令 %r" % cmd)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

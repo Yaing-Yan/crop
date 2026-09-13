@@ -46,13 +46,16 @@ class Options:
     allow_pivot: bool = True       # 是否允许用栈枢轴实现内部跳转
     left_base: int = 0xE9E0        # 链存放位置（左侧地址基准，来自 launcher.conf）
     right_base: int = 0xD3C0       # 右侧地址基准
+    routines: Sequence = ()        # ROM 例程（crop/routines.py）：在 .bin 里出现即发一个链槽
+    rt_push: Optional[object] = None   # rt-fix 原语（给以 RT 结尾的例程用）
 
 
 @dataclass
 class Decision:
     off: int
     size: int
-    kind: str                      # 'block' | 'pop_block' | 'pop_imm' | 'jump' | 'anchor' | 'unsupported'
+    kind: str                      # 'block' | 'pop_block' | 'pop_imm' | 'jump' | 'anchor'
+                                   # | 'routine' | 'rt_fix' | 'unsupported'
     detail: str
     chain_bytes: int = 0
     addr: Optional[int] = None      # 命中的 ROM gadget 地址（block/pop_imm/jump 有效）
@@ -75,8 +78,10 @@ class Result:
             "L3 跳转 %d 处，无法翻译 %d 条 (%.1f%%)" % (
                 s["insns"], s["l1"], 100.0 * s["l1"] / tot, s["l2"], 100.0 * s["l2"] / tot,
                 s["jump"], s["unsupported"], 100.0 * s["unsupported"] / tot),
-            "链总长 %d 字节（%.1f 字节/指令）；共 %d 个块、%d 个锚点" % (
-                s["chain_bytes"], s["chain_bytes"] / tot, s["blocks"], s["anchors"]),
+            "链总长 %d 字节（%.1f 字节/指令）；共 %d 个块（其中 ROM 例程调用 %d 次）、"
+            "%d 个锚点" % (
+                s["chain_bytes"], s["chain_bytes"] / tot, s["blocks"], s.get("lib", 0),
+                s["anchors"]),
         ]
         if s["unsupported"]:
             c = collections.Counter(d.detail.split("（")[0] for d in self.decisions
@@ -174,13 +179,16 @@ def translate(db: GadgetDB, code: bytes, opts: Optional[Options] = None) -> Resu
             if t is not None and 0 <= t < len(code) and t in by_off:
                 labels.setdefault(t, "L%04X" % t)
 
+    routs = sorted(getattr(opts, "routines", ()) or (), key=lambda r: -len(r.code))
+    rt_push = getattr(opts, "rt_push", None)
+
     cb = ChainBuilder(left_base=opts.left_base, right_base=opts.right_base)
     dsl: List[str] = ["// CROP 自动生成：.bin → ROP 链",
                       "// pivot_side=%s  form=%s  max_insns=%d" % (
                           opts.pivot_side, opts.form, opts.max_insns), ""]
     used_gadgets: Dict[str, int] = {}
     decisions: List[Decision] = []
-    stats = collections.Counter(insns=len(insns), l1=0, l2=0, jump=0,
+    stats = collections.Counter(insns=len(insns), l1=0, l2=0, jump=0, lib=0,
                                 unsupported=0, blocks=0, anchors=0, chain_bytes=0)
 
     def gslot(addr: int) -> None:
@@ -207,6 +215,39 @@ def translate(db: GadgetDB, code: bytes, opts: Optional[Options] = None) -> Resu
             dsl.append("<%s%s>" % ("-" if opts.pivot_side == LEFT else "", name))
             stats["anchors"] += 1
             decisions.append(Decision(ins.addr, 0, "anchor", name))
+
+        # ---------------- ROM 例程调用（A1）---------------------------------
+        # `.bin` 里出现"某个 ROM 例程从入口到结尾的整段字节" → 发一个链槽跳过去。
+        # 以 ``RT`` 结尾的例程还要先发一个 rt-fix 槽（把"回来后继续吃链"压进硬件返回栈）。
+        hit = None
+        for r in routs:
+            if code.startswith(r.code, ins.addr):
+                hit = r
+                break
+        if hit is not None:
+            if hit.needs_push and rt_push is None:
+                stats["unsupported"] += 1
+                decisions.append(Decision(ins.addr, len(hit.code), "unsupported",
+                                          "例程 %s（RT 结尾）缺少 rt-fix 原语" % hit.name))
+                i += hit.ninsn
+                continue
+            if hit.needs_push:
+                dsl.append("// %04X: 例程 %s @%05X 以 RT 结尾 → 先 rt-fix @%05X"
+                           % (ins.addr, hit.name, hit.entry, rt_push.addr))
+                gslot(rt_push.addr)
+                stats["lib"] += 1
+                stats["blocks"] += 1
+                decisions.append(Decision(ins.addr, 0, "rt_fix",
+                                          "rt-fix @%05X" % rt_push.addr, 4, rt_push.addr))
+            dsl.append("// %04X: 调用 ROM 例程 %s @%05X（%d 条指令）"
+                       % (ins.addr, hit.name, hit.entry, hit.ninsn))
+            gslot(hit.entry)
+            stats["lib"] += 1
+            stats["blocks"] += 1
+            decisions.append(Decision(ins.addr, len(hit.code), "routine",
+                                      "rom:%s" % hit.name, 4, hit.entry))
+            i += hit.ninsn
+            continue
 
         # ---------------- 取数原语（POP <reg>）：链数据就在 .bin 里紧跟其后 ----
         # 约定：`.bin` 中 ``POP <reg>`` 之后紧跟该指令要弹走的 ``sp_delta`` 个字节，
