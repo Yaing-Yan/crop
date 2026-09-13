@@ -34,7 +34,29 @@ cd <EMU_DIR> && ./CasioEmuMsvc models/<VERF_MODEL_DIR>
    出错的一环，`b = a` 读回 7 就是它的直接证据；
 3. 变量区 `0xD700` 在这台机器上可用（先前"写不进去"的结论是**没触发**造成的假象）。
 
-## 2. `examples/rstring.c` —— 离线已确证语义；真机：链跑了但跑飞（round 13）
+## 2. `examples/rstring.c` —— **之前的"✗"部分是核对地址写错了**（round 21 更正）
+
+**教训**：`#include` 写在最前面 ⇒ 头文件里那些函数的**形参槽先被分配**，
+所以 `msg` 根本不在 `0xD700`。实测布局（`--src` 现场编译得到）：
+
+```
+d@0xD700  s@0xD702  v@0xD70A  lo@0xD712  hi@0xD713  acc@0xD714  msg@0xD715
+```
+
+而我 round 13–19 一律按 `D700..D707` 去核对 `msg` ⇒ **假阴性**。
+更硬的证据是 machine 里真实留下的值：
+
+```
+D712 = 41 ('A')   D713 = 42 ('B')      ← 正是 lo = msg[0]; hi = msg[1] 的结果
+```
+
+这两字节只有在 `rfill8` → `rcopy4(msg,"ABOP")` → `rput16(msg,65,66)` →
+`lo = msg[0]; hi = msg[1]` **全部正确执行**后才会出现 ⇒ 搬运/数组/函数内联在真机上是好的。
+
+对策（已实现）：`tools/crop-verify --src FILE --expect-var 名字=值` —— 变量地址由**现场编译**
+结果解析，不再手写。凡是"链跑飞/没落地"的判断，今后都必须用 `--expect-var` 复核。
+
+## 2'. rstring 更早的排查记录（round 13–19）
 
 ```
 注入：428 字节链 @0xEC00（回读一致）、launcher @0xD248、账本 0xD244=07、D700..D70F 清零

@@ -107,6 +107,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="CROP 真机端到端验证（MCP）")
     ap.add_argument("--rom-dir", required=True)
     ap.add_argument("--bin", required=True, help="rGCC 产出的 .bin（会被就地翻译成链）")
+    ap.add_argument("--src", help="对应的 C 源码：给了就能用 --expect-var 按变量名核对"
+                                 "（地址随 include 顺序变化，手写地址极易核对错）")
+    ap.add_argument("--expect-var", action="append", default=[],
+                    help="期望的变量值，形如 msg=41,42,4F,50 或 lo=41（名字取自 --src 编译结果）")
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ap.add_argument("--conf", default=os.path.join(root, "launcher.conf"))
     ap.add_argument("--left-base", default=None, help="链地址（默认取 launcher.conf）")
@@ -138,6 +142,22 @@ def main() -> int:
     be = Backend(db)
     lib = Library(be, rom, LabelTable(load_labels(os.path.join(root, "labels.conf")), rom))
     code = open(args.bin, "rb").read()
+
+    # 变量地址：从 --src 现场编译出来（不要手写；形参槽会随 include 顺序提前分配）
+    var_addr = {}
+    if args.src:
+        from crop.preproc import preprocess
+        inc = [os.path.join(root, "include"), os.path.dirname(os.path.abspath(args.src))]
+        with open(args.src, encoding="utf-8") as fh:
+            raw = fh.read()
+        cu = compile_source(preprocess(raw, inc, origin=args.src)[0], be,
+                            data_base=data_base, lib=lib)
+        var_addr = {k: v.addr for k, v in cu.vars.items()}
+        print("变量布局（--src 编译结果）：%s" % ", ".join(
+            "%s@%04X" % (k, v) for k, v in sorted(var_addr.items(), key=lambda kv: kv[1])))
+        if cu.code != code:
+            print("⚠ --src 编出来的 .bin 与 --bin 不一致（%d vs %d 字节）"
+                  % (len(cu.code), len(code)))
     verify_translatable(code, db, routines=tuple(lib.routines.values()))
     opts = Options(left_base=conf.left_addr, routines=tuple(lib.routines.values()),
                    rt_push=lib.rt_push)
@@ -187,6 +207,19 @@ def main() -> int:
 
     print("\n--- 读回 ---")
     ok = True
+    for spec in args.expect_var:
+        name, _, v_s = spec.partition("=")
+        if name not in var_addr:
+            print("  ✗ 未知变量 %s（见上面的变量布局）" % name)
+            ok = False
+            continue
+        want = bytes(int(t, 16) for t in v_s.replace(",", " ").split())
+        a = var_addr[name]
+        got = read_mem(a, len(want), **kw)
+        good = got == want
+        ok = ok and good
+        print("  %s[%04X] 期望 %s  实际 %s  %s"
+              % (name, a, want.hex(" ").upper(), got.hex(" ").upper(), "✓" if good else "✗"))
     for spec in args.expect:
         a_s, _, v_s = spec.partition("=")
         addr = int(a_s, 16)
