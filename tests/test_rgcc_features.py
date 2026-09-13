@@ -126,6 +126,31 @@ class TestFeatures(unittest.TestCase):
             self.c("void f(void) { f(); }\nvoid main(void){ f(); while(1){} }\n")
         self.assertIn("递归", str(cm.exception))
 
+    def test_for_loop_is_unrolled_with_constant_index(self):
+        cu = self.c("unsigned char s[4] = {1,2,3,4};\nunsigned char d[4];\n"
+                    "void main(void){ for (unsigned char i = 0; i < 4; i = i + 1) { d[i] = s[i]; }"
+                    " while(1){} }\n")
+        d, src_ = cu.vars["d"], cu.vars["s"]
+        self.assertEqual(self.be.copy_var(d.addr, src_.addr)[:2], cu.code[
+            cu.code.index(self.be.copy_var(d.addr, src_.addr)):][:2])
+
+    def test_rstring_header_compiles(self):
+        cu = self.c('#include <rstring.h>\n#include <rstdlib.h>\n'
+                    'unsigned char msg[8];\nunsigned char t;\n'
+                    'void main(void){ rcopy4(msg, "CROP"); rfill4(msg, 32);'
+                    ' rput16(msg, 65, 66); t = msg[0]; rhalt(); }\n')
+        self.assertIn("rcopy4", cu.funcs)
+        self.assertIn("rfill4", cu.funcs)
+        self.assertIn("rhalt", cu.funcs)
+        res = translate(self.db, cu.code, Options(left_base=0xEC00))
+        self.assertEqual(res.stats["unsupported"], 0, res.report())
+
+    def test_for_with_nonconstant_bound_is_refused(self):
+        with self.assertRaises(RgccError):
+            self.c("unsigned char n;\nunsigned char d[4];\n"
+                   "void main(void){ for (unsigned char i = 0; i < n; i = i + 1) { d[i] = 1; }"
+                   " while(1){} }\n")
+
     def test_nonconstant_expression_still_refused(self):
         with self.assertRaises(RgccError):
             self.c("unsigned char a;\nunsigned char b;\n"

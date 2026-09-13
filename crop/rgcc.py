@@ -356,7 +356,7 @@ _TOKEN = re.compile(r"""
   | (?P<str>"(?:[^"\\]|\\.)*")
   | (?P<num>0[xX][0-9a-fA-F]+|\d+)
   | (?P<id>[A-Za-z_]\w*)
-  | (?P<op><<|>>|->|[-+*/%&|^~])
+  | (?P<op><<|>>|<=|>=|->|[-+*/%&|^~<>])
   | (?P<punct>[{}();=,.\][])
 """, re.VERBOSE)
 
@@ -401,6 +401,10 @@ class Parser:
         self.scope: Dict[str, Sym] = {}          # 当前函数作用域（全局时为空）
         self.initials: Dict[int, bytes] = {}     # 静态初值
         self.cur_fn: Optional[Func] = None
+        self.const_env: Dict[str, int] = {}      # 编译期常量（for 展开的循环变量）
+
+    def fold(self, e):
+        return _fold(e, self.const_env)
 
     # ---------------------------------------------------------------- 基础
     def peek(self) -> Tuple[str, str, int]:
@@ -695,7 +699,70 @@ class Parser:
             return Stmt(kind="copy", dst=dst, src=src, line=line)
         raise RgccError("第 %d 行：无法解析的语句 %r" % (line, text))
 
+    def parse_for(self, line: int) -> Stmt:
+        """``for (i = 0; i < N; i = i + 1) { … }`` —— N 必须是常量，循环在编译期展开。
+
+        （ROP 链里没有条件分支，所以运行时循环只能靠 `while(1)`；固定次数的循环
+        直接展开成 N 份直线代码。展开时循环变量按常量代入，于是 `a[i]` 的下标是常量。）
+        """
+        self.expect("for")
+        self.expect("(")
+        if self.peek()[1] in ("unsigned", "char"):
+            self.parse_type()
+        var = self.expect_kind("id")[1]
+        self.expect("=")
+        start = self.const_expr("for 初值")
+        self.expect(";")
+        if self.expect_kind("id")[1] != var:
+            raise RgccError("第 %d 行：for 的条件里必须是循环变量 %s" % (line, var))
+        op = self.next()[1]
+        if op not in ("<", "<=", "!="):
+            raise RgccError("第 %d 行：for 条件只支持 < / <= / !=" % line)
+        bound = self.const_expr("for 上界")
+        self.expect(";")
+        if self.expect_kind("id")[1] != var:
+            raise RgccError("第 %d 行：for 的步进里必须是循环变量 %s" % (line, var))
+        self.expect("=")
+        if self.expect_kind("id")[1] != var:
+            raise RgccError("第 %d 行：for 步进只支持 i = i ± 常量" % line)
+        sop = self.next()[1]
+        if sop not in ("+", "-"):
+            raise RgccError("第 %d 行：for 步进只支持 i = i ± 常量" % line)
+        step = self.const_expr("for 步长")
+        self.expect(")")
+        if step <= 0:
+            raise RgccError("第 %d 行：for 步长必须为正" % line)
+        brace = self.i
+        self.expect("{")
+        body_start = brace
+        depth = 1
+        while depth:
+            t = self.next()[1]
+            if t == "{":
+                depth += 1
+            elif t == "}":
+                depth -= 1
+        body_end = self.i
+        vals, v = [], start
+        while (v < bound) if op == "<" else (v <= bound) if op == "<=" else (v != bound):
+            vals.append(v)
+            v += step if sop == "+" else -step
+            if len(vals) > 1024:
+                raise RgccError("第 %d 行：for 展开超过 1024 次，太大" % line)
+        out: List[Stmt] = []
+        for k in vals:
+            saved = self.const_env
+            self.const_env = dict(saved)
+            self.const_env[var] = k
+            self.i = body_start
+            out.extend(self.parse_block())
+            self.const_env = saved
+        self.i = body_end
+        return Stmt(kind="block", body=out, line=line)
+
     def parse_control(self, text: str, line: int) -> Stmt:
+        if text == "for":
+            return self.parse_for(line)
         if text != "while":
             raise RgccError("第 %d 行：v0 只支持 while(1)（if/%s 需要条件分支，见 A7）" % (line, text))
         self.next()
@@ -831,7 +898,7 @@ class Parser:
         ep = _ExprParser(self.toks[self.i:])
         e = ep.parse()
         self.i += ep.i                                   # parse 不消费 ';'
-        got = _fold(e)
+        got = self.fold(e)
         if got.kind == "const":
             return MemRef(kind="imm", value=got.value, note=str(got.value))
         sym = self.lookup(got.var, self.peek()[2])
@@ -843,9 +910,9 @@ class Parser:
     def const_expr(self, what: str) -> int:
         """常量表达式（下标/长度/初值）——必须是编译期可算的。"""
         ep = _ExprParser(self.toks[self.i:])
-        e = ep.parse(stops=("]", ",", "}", ";"))
+        e = ep.parse(stops=("]", ")", ",", "}", ";"))
         self.i += ep.i
-        got = _fold(e)
+        got = self.fold(e)
         if got.kind != "const":
             raise RgccError("%s 必须是编译期常量（运行时算术/索引见 A4/A7）" % what)
         return got.value
@@ -875,7 +942,7 @@ class Assign:
     var: str = ""
 
 
-def _fold(e: Expr) -> Assign:
+def _fold(e: Expr, env: Optional[Dict[str, int]] = None) -> Assign:
     """把表达式折叠成"能落地"的形式，否则报错说明缺什么。
 
     本 ROM 的可内联 gadget 里没有通用算术（第 2 步实测：干净 ALU 只有 48 种
@@ -885,18 +952,23 @@ def _fold(e: Expr) -> Assign:
     其它一律明确报错，不生成错代码。
     """
     if e.op is None:
-        return e.value if isinstance(e.value, Assign) else Assign("const", int(e.value))
+        if isinstance(e.value, Assign):
+            v = e.value
+            if v.kind == "var" and env and v.var in env:      # 循环变量在展开后是常量
+                return Assign("const", env[v.var])
+            return v
+        return Assign("const", int(e.value))
     if e.op == "u-":
-        a = _fold(e.left)
+        a = _fold(e.left, env)
         if a.kind == "const":
             return Assign("const", -a.value)
         raise RgccError("一元 '-' 只支持常量操作数（本 ROM 无通用算术 gadget）")
     if e.op == "u~":
-        a = _fold(e.left)
+        a = _fold(e.left, env)
         if a.kind == "const":
             return Assign("const", ~a.value)
         raise RgccError("一元 '~' 只支持常量操作数（本 ROM 无通用算术 gadget）")
-    a, b = _fold(e.left), _fold(e.right)
+    a, b = _fold(e.left, env), _fold(e.right, env)
     if a.kind == "const" and b.kind == "const":
         x, y = a.value, b.value
         try:
@@ -1174,6 +1246,8 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
                 da, sa = addr(st.dst, st.line), addr(st.src, st.line)
                 emit(backend.copy_var(da, sa),
                      "%s = %s;            // [%04X] ← [%04X]" % (st.dst.note, st.src.note, da, sa))
+            elif st.kind == "block":                     # for 展开出来的直线代码
+                gen(st.body, scope, cur, end_label)
             elif st.kind == "loop":
                 lid = new_label("loop")
                 listing.append("      // while(1) ----")

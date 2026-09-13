@@ -39,8 +39,8 @@ driving the emulator. Run any of them with `--help`.
 | Header | Contents |
 |---|---|
 | `rstdio.h` | screen output: `rprint(font, row, text)`, `rrefresh()`, `rclear()`, plus `SCREEN_BUF` and the `FONT_*` constants |
-| `rstring.h` | *planned*: string/memory helpers |
-| `rstdlib.h` | *planned*: sleep / power / misc ROM routines |
+| `rstring.h` | constant-length copies/fills (`rcopy4/8`, `rfill4/8`, `rput16`) |
+| `rstdlib.h` | `rhalt()`, `rspin64()`（ROM 的延时/屏幕例程待真机确证后再放进来） |
 
 `romlabels_ver*.h` are **generated** per ROM by `tools/crop-labels` — never edited by hand.
 
@@ -53,8 +53,9 @@ driving the emulator. Run any of them with `--help`.
 | Calling ROM routines from C (rt-fix, auto-discovered) | ✅ done (`rprint` / `rrefresh` / `rclear`) |
 | Variables, constant expressions, `while(1)`, block writes | ✅ done |
 | Functions (inlined), arrays (constant index), structs, compile-time pointers | ✅ done |
+| Constant-trip `for` loops (compile-time unrolled) → `rstring.h` helpers | ✅ done |
 | Runtime pointers (address held in a variable), conditional `if` / `while(cond)` | ❌ not yet — the ROM lacks the primitive this needs (`docs/step-7-A7条件分支调研.md`) |
-| `rstring.h` / `rstdlib.h` | ❌ not yet |
+
 
 Measurements, injection procedure and on-device records live in `docs/`
 (`step-1 … step-7`, `注入规程.md`, `任务清单.md`).
