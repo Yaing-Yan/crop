@@ -99,7 +99,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="CROP 真机端到端验证（MCP）")
     ap.add_argument("--rom-dir", required=True)
     ap.add_argument("--bin", required=True, help="rGCC 产出的 .bin（会被就地翻译成链）")
-    ap.add_argument("--conf", default="launcher.conf")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ap.add_argument("--conf", default=os.path.join(root, "launcher.conf"))
     ap.add_argument("--left-base", default=None, help="链地址（默认取 launcher.conf）")
     ap.add_argument("--data-base", default=None, help="变量区基址（十六进制）")
     ap.add_argument("--expect", action="append", default=[],
@@ -127,7 +128,7 @@ def main() -> int:
     from crop.rgcc import Backend, compile_source, verify_translatable
 
     be = Backend(db)
-    lib = Library(be, rom, LabelTable(load_labels("labels.conf"), rom))
+    lib = Library(be, rom, LabelTable(load_labels(os.path.join(root, "labels.conf")), rom))
     code = open(args.bin, "rb").read()
     verify_translatable(code, db, routines=tuple(lib.routines.values()))
     opts = Options(left_base=conf.left_addr, routines=tuple(lib.routines.values()),

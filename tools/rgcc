@@ -38,8 +38,9 @@ def main() -> int:
     ap.add_argument("--dsl", help="同时导出 RopIDE .rop")
     ap.add_argument("-I", "--include", action="append", default=[],
                     help="头文件搜索目录（#include），可多次")
-    ap.add_argument("--labels", default="labels.conf",
-                    help="标签表（库例程入口按签名逐 Ver 解析；默认 labels.conf）")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ap.add_argument("--labels", default=os.path.join(root, "labels.conf"),
+                    help="标签表（库例程入口按签名逐 Ver 解析；默认仓库根的 labels.conf）")
     ap.add_argument("--no-lib", action="store_true",
                     help="不用库表（此时调用库函数会报错）")
     ap.add_argument("--max-insns", type=int, default=8)
