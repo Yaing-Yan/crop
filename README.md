@@ -1,5 +1,7 @@
 # CROP — 用 C 写 ROP
 
+> 许可证：**GPL-3.0-or-later** · 面向 **CASIO fx-991 CN X**（nX-U16）
+
 > **C** to **R**eturn-**O**riented **P**rogramming —— 把 C 程序编译、翻译成
 > **CASIO fx-991 CN X**（nX-U16 / "ePS-16" 核，CY-239F）上可执行的 **ROP 链**。
 
@@ -305,7 +307,7 @@ python3 -m unittest discover -s tests -v      # 42 项
 
 ## 许可与致谢
 
-* 本项目代码：**MIT**（见 `LICENSE`）。
+* 本项目代码：**GPL-3.0-or-later**（见 `LICENSE`）—— 与 RopIDE 系列工具（同为 GPL-3.0）保持一致。
 * `crop/nxu16/isa.py`、`crop/nxu16/disasm.py` 复用自 `nxu16-decompiler`
   （由 CasioEmuMsvc 的 `casioemu::CPU::opcode_sources` 自动生成，并已与模拟器自带反汇编
   `_disas.txt` 逐行对拍通过）。
