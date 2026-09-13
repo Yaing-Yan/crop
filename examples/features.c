@@ -1,7 +1,7 @@
 /* features.c —— A2 函数 / A3 数组 / A5 结构体 的最小演示（配合 include/rstdio.h）
  *
  * 编译：
- *   tools/rgcc --rom-dir ~/casioemu/models/fx991cnxfVirtual -I include \
+ *   tools/rgcc --rom-dir <VERF_MODEL_DIR> -I include \
  *              --data-base D700 --left-base EC00 examples/features.c \
  *              -o out/features.bin --asm --rop out/features-Rop.bin
  *

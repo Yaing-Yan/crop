@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """crop-plan —— 路线 A 的能力度量与"字节传送"合成素材扫描。
 
-    tools/crop-plan --rom-dir ~/casioemu/models/fx991cnxfVirtual
+    tools/crop-plan --rom-dir <VERF_MODEL_DIR>
     tools/crop-plan --rom-dir ... --targets "ADD R0, #1" "OR R0, R1"
 
 对每条目标指令，把 ROM 里所有"包含它的 gadget"分三档：

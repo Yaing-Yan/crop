@@ -7,6 +7,14 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+from crop.models import model_dir   # noqa: E402
+
+
+def _m(which):
+    try:
+        return model_dir(which)
+    except LookupError:
+        return ""
 
 from crop.gadget import scan                                      # noqa: E402
 from crop.interp import Options, translate                        # noqa: E402
@@ -14,7 +22,14 @@ from crop.nxu16 import decode as _dec                             # noqa: E402
 from crop.rgcc import Backend, RgccError, compile_source, verify_translatable  # noqa: E402
 from crop.rom import RomImage                                     # noqa: E402
 
-MODEL = os.path.expanduser("~/casioemu/models/fx991cnxfVirtual")
+def _m(which):
+    try:
+        return model_dir(which)
+    except LookupError:
+        return ""
+
+
+MODEL = _m("verf")
 
 DEMO = """
 unsigned char flag;

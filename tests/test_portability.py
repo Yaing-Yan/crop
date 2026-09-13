@@ -21,12 +21,20 @@ from crop.nxu16 import decode as _dec                             # noqa: E402
 from crop.rgcc import Backend, compile_source                     # noqa: E402
 from crop.rom import RomImage                                     # noqa: E402
 
-BASE = os.path.expanduser("~/casioemu/models")
-#: 同机型不同 Ver（目录名可能重复，用路径区分）
-MODELS = [os.path.join(BASE, p) for p in (
-    "fx991cnxfVirtual", "fx991cnxVirtual",
-    "models/fx991cnx", "models/fx991cnxVirtual",
-)]
+from crop.models import local as _local                 # noqa: E402
+
+
+def _models():
+    """跨版本回归用的 ROM 目录：从本机私有的 .crop-local.conf 里读 ``multi`` 键。"""
+    out = []
+    for p in (_local("multi") or "").replace(",", " ").split():
+        p = os.path.expanduser(p)
+        if os.path.isdir(p):
+            out.append(p)
+    return out
+
+
+MODELS = _models()
 
 SRC = ("unsigned char aa;\nunsigned char bb;\n"
        "void main(void){ aa = 2*(3+4); bb = aa; }\n")

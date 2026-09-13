@@ -5,7 +5,7 @@
 
 ## 一、做了什么
 
-`crop/ropvm.py` 接入你自己的 `~/nxu16-decompiler/rom991cnx_lifted.py`（真 ROM 的
+`crop/ropvm.py` 接入你自己的 `<LIFTED_PY>`（真 ROM 的
 lifted 模拟器），提供：
 
 * `run_rop_chain(chain, left_base, watch, pop_pc_bytes)`：把链写进 RAM，按 launcher
@@ -47,7 +47,7 @@ def pop8(self):
     return v
 ```
 
-几乎可以确定是转写笔误，建议回馈到 `~/nxu16-decompiler`。
+几乎可以确定是转写笔误，建议回馈到 `<NXU16_DECOMPILER>`。
 本仓库用 `run_rop_chain(..., pop_pc_bytes=4)` 显式修正，并有对照测试守住这个约定。
 
 ## 四、第 4b 步：引导（launcher）—— ✅ 已在真模拟器上跑通

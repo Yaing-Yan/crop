@@ -15,6 +15,14 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+from crop.models import model_dir   # noqa: E402
+
+
+def _m(which):
+    try:
+        return model_dir(which)
+    except LookupError:
+        return ""
 
 from crop.gadget import scan                            # noqa: E402
 from crop.interp import Options, translate               # noqa: E402
@@ -27,8 +35,8 @@ from crop.rom import RomImage                            # noqa: E402
 from crop.routines import build_routines, find_rt_push, routine_body   # noqa: E402
 
 MODELS = {
-    "VerF": os.path.expanduser("~/casioemu/models/fx991cnxfVirtual"),
-    "VerC": os.path.expanduser("~/casioemu/models/models/fx991cnxVirtual"),
+    "VerF": _m("verf"),
+    "VerC": _m("verc"),
 }
 HAVE = {k: os.path.isdir(v) for k, v in MODELS.items()}
 

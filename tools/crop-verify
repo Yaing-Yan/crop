@@ -9,7 +9,7 @@
 4. 长按【→】再长按【=】触发；
 5. 读回数据区 / 屏幕缓冲区，把屏幕缓冲区**解码成点阵**打印出来（像素级证据）。
 
-    tools/crop-verify --rom-dir ~/casioemu/models/fx991cnxfVirtual \
+    tools/crop-verify --rom-dir <VERF_MODEL_DIR> \
         --bin out/hello.bin --data-base D700 --expect D137=0E --screen
 
 没有 MCP 时加 `--dry-run`：只生成并打印注入字节，不碰机器。

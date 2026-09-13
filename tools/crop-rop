@@ -2,7 +2,7 @@
 """crop-rop —— CROP 的 ROP 解释器：`.bin`（nX-U16 机器码）→ `Rop.bin`（ROP 链）。
 
 用法：
-    tools/crop-rop --rom-dir ~/casioemu/models/fx991cnxfVirtual -i prog.bin -o out/Rop.bin
+    tools/crop-rop --rom-dir <VERF_MODEL_DIR> -i prog.bin -o out/Rop.bin
     tools/crop-rop -r rom.bin --vocab                        # 只打印 ROP 词表
     tools/crop-rop -r rom.bin -i prog.bin --dsl out/prog.rop # 同时导出 RopIDE 可打开的 .rop
 """

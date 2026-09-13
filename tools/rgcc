@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """rgcc —— 面向 ROP 的 C 子集编译器：`.c` → nX-U16 `.bin`（可 100% 被解释器翻译）。
 
-    tools/rgcc --rom-dir ~/casioemu/models/fx991cnxfVirtual demo.c -o out/demo.bin --asm
+    tools/rgcc --rom-dir <VERF_MODEL_DIR> demo.c -o out/demo.bin --asm
     tools/rgcc --rom-dir ... demo.c -o out/demo.bin --rop out/Rop.bin --dsl out/demo.rop
 
 `--rop` 会直接接着跑解释器，把 .bin 变成 ROP 链，并打印覆盖率（必须 0 条不支持）。

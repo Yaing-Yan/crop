@@ -11,9 +11,17 @@ sys.path.insert(0, ROOT)
 from crop.labels import LabelTable, gen_header, load_labels   # noqa: E402
 from crop.rom import RomImage                                 # noqa: E402
 
-BASE = os.path.expanduser("~/casioemu/models")
-MODELS = {"verf": os.path.join(BASE, "fx991cnxfVirtual"),
-          "verc": os.path.join(BASE, "models/fx991cnxVirtual")}
+from crop.models import model_dir as _model_dir           # noqa: E402
+
+
+def _m(which):
+    try:
+        return _model_dir(which)
+    except LookupError:
+        return ""
+
+
+MODELS = {"verf": _m("verf"), "verc": _m("verc")}
 CONF = os.path.join(ROOT, "labels.conf")
 
 

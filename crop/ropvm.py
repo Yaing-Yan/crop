@@ -8,10 +8,11 @@
 * 走 **直译路径**：直接执行 `.bin`（同一台机器、同一份 RAM 初始状态）；
 * 两条路径结束后比较目标 RAM 字节 —— 相同即说明"翻译"没改变语义。
 
-模拟器来自 ``~/nxu16-decompiler/rom991cnx_lifted.py``（13 MB，导入较慢，只导一次）。
+模拟器来自 ``<LIFTED_PY>``（13 MB，导入较慢，只导一次）。
 """
 
 from __future__ import annotations
+from crop.models import lifted_path   # noqa: E402
 
 import importlib.util
 import os
@@ -24,7 +25,14 @@ from .chain import encode_gadget, encode_value
 __all__ = ["LIFTED_PATH", "lifted_module", "RopRun", "run_rop_chain", "run_linear",
            "BRK_ADDR"]
 
-LIFTED_PATH = os.path.expanduser("~/nxu16-decompiler/rom991cnx_lifted.py")
+def _lifted_default() -> str:
+    try:
+        return lifted_path()
+    except LookupError:
+        return ""
+
+
+LIFTED_PATH = _lifted_default()
 
 #: ROM 里一个 ``FF FF``（BRK）地址，用作链尾哨兵：执行到它就干净停机。
 BRK_ADDR = 0x95C

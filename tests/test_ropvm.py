@@ -4,7 +4,7 @@
 这是"翻译正确性"的最终证据：把 rgcc 产出的 .bin 翻译成链，写进 RAM，
 用真 ROM 跑，看 RAM 终态是否等于 C 程序的语义。
 
-依赖 ~/nxu16-decompiler/rom991cnx_lifted.py（缺失则跳过）。
+依赖 <LIFTED_PY>（缺失则跳过）。
 """
 
 import os
@@ -13,6 +13,14 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+from crop.models import model_dir   # noqa: E402
+
+
+def _m(which):
+    try:
+        return model_dir(which)
+    except LookupError:
+        return ""
 
 from crop.chain import encode_gadget                        # noqa: E402
 from crop.gadget import scan                                # noqa: E402
@@ -21,7 +29,14 @@ from crop.rgcc import Backend, compile_source               # noqa: E402
 from crop.rom import RomImage                               # noqa: E402
 from crop.ropvm import BRK_ADDR, LIFTED_PATH, run_rop_chain  # noqa: E402
 
-MODEL = os.path.expanduser("~/casioemu/models/fx991cnxfVirtual")
+def _m(which):
+    try:
+        return model_dir(which)
+    except LookupError:
+        return ""
+
+
+MODEL = _m("verf")
 
 
 @unittest.skipUnless(os.path.isdir(MODEL) and os.path.isfile(LIFTED_PATH),

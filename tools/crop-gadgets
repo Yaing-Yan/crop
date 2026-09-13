@@ -2,8 +2,8 @@
 """crop-gadgets —— 扫描 ROM.bin，建立/报告 ROP gadget 索引。
 
 用法示例：
-    tools/crop-gadgets -r ~/casioemu/models/fx991cnxfVirtual/rom.bin
-    tools/crop-gadgets --rom-dir ~/casioemu/models/fx991cnxfVirtual --demo 2000
+    tools/crop-gadgets -r <VERF_MODEL_DIR>/rom.bin
+    tools/crop-gadgets --rom-dir <VERF_MODEL_DIR> --demo 2000
     tools/crop-gadgets -r rom.bin --json out/gadgets.json
 
 ``--demo`` 做可行性评估：把 ROM 里现成的"直线代码段"当作假想的 rGCC 输出，

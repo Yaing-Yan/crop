@@ -11,13 +11,28 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+from crop.models import local, model_dir   # noqa: E402
+
+
+def _m(which):
+    try:
+        return model_dir(which)
+    except LookupError:
+        return ""
 
 from crop.gadget import scan, split_greedy           # noqa: E402
 from crop.nxu16 import decode as _dec                # noqa: E402
 from crop.rom import RomImage                        # noqa: E402
 
-MODEL = os.path.expanduser("~/casioemu/models/fx991cnxfVirtual")
-ROPFILE = os.path.expanduser("~/Downloads/Pixel Editor 𝑷𝒓𝒐 - v1.1.rop")
+def _m(which):
+    try:
+        return model_dir(which)
+    except LookupError:
+        return ""
+
+
+MODEL = _m("verf")
+ROPFILE = (local("ropfile") or "")          # 参考 .rop（本机私有配置）
 
 # RopIDE 的 VerF gadget 预设（人工挑出、真机验证过的），用来对拍我们的扫描器
 ROPRIDE_KNOWN = {

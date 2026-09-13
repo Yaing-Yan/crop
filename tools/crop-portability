@@ -4,7 +4,7 @@
 对每个机型/版本目录，检查"流水线依赖的原语"能否**从该 ROM 自动推出来**，
 并打印推导结果。任何一项标 MISSING，就说明那一步有硬编码、换 Ver 会断。
 
-    tools/crop-portability ~/casioemu/models/fx991cnxfVirtual ~/casioemu/models/fx991cnxVirtual ...
+    tools/crop-portability <VERF_MODEL_DIR> <ROM2_MODEL_DIR> ...
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import sys
 from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from crop.models import model_dir   # noqa: E402
 
 from crop.gadget import scan                                  # noqa: E402
 from crop.nxu16 import decode as _dec                         # noqa: E402
@@ -75,7 +76,11 @@ def launcher_for(best, left_addr: int = 0xE9E0) -> Optional[bytes]:
 
 
 def main() -> int:
-    dirs = sys.argv[1:] or [os.path.expanduser("~/casioemu/models/fx991cnxfVirtual")]
+    try:
+        default = [model_dir("verf")]
+    except LookupError:
+        default = []
+    dirs = sys.argv[1:] or default
     print("%-24s %-8s %-22s %-26s %s" % ("ROM", "自增等", "写字节原语", "变量槽(L+ST)", "最省枢轴"))
     for d in dirs:
         rom = RomImage.auto(d)

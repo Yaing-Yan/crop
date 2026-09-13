@@ -4,7 +4,7 @@
 ROM 是卡西欧自己的 nX-U16 C 编译器产物，所以拿它的函数体当 rGCC 输出的代理
 是最贴近的评估。逐个函数（`PUSH LR` … 末尾 `POP PC`）翻译，统计 L1/L2/不支持。
 
-    tools/crop-eval --rom-dir ~/casioemu/models/fx991cnxfVirtual --limit 200
+    tools/crop-eval --rom-dir <VERF_MODEL_DIR> --limit 200
 """
 
 from __future__ import annotations

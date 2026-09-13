@@ -7,10 +7,25 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+from crop.models import model_dir   # noqa: E402
+
+
+def _m(which):
+    try:
+        return model_dir(which)
+    except LookupError:
+        return ""
 
 from crop.launcher import (LAUNCHER_GADGET_REAL, launcher_bytes, parse_conf)  # noqa: E402
 
-MODEL = os.path.expanduser("~/casioemu/models/fx991cnxfVirtual")
+def _m(which):
+    try:
+        return model_dir(which)
+    except LookupError:
+        return ""
+
+
+MODEL = _m("verf")
 CONF = os.path.join(ROOT, "launcher.conf")
 
 

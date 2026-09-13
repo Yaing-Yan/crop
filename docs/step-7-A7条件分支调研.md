@@ -1,7 +1,7 @@
 # 第 7 步（调研）：A7 条件分支 —— ROM 原语盘点与结论
 
 > 目标：把 `if (cond) … else …` / `while (cond) …` 做进 rGCC。
-> 用户给的线索：`~/casioemu/models/nX-U16_ROP_Gadget_Mapping.md`
+> 用户给的线索：`<EMU_DIR>/models/nX-U16_ROP_Gadget_Mapping.md`
 > 第 7 节 + "条件跳转的 ROP 实现（方法一：栈操作法）"。
 
 ## 一、把"栈操作法"翻译成本 ISA 的要求
@@ -69,7 +69,7 @@ python3 - <<'PY'
 import sys, os; sys.path.insert(0, '.')
 from crop.rom import RomImage
 from crop.cond import scan_cond
-cp = scan_cond(RomImage.auto(os.path.expanduser('~/casioemu/models/fx991cnxfVirtual')).space)
+cp = scan_cond(RomImage.auto(model_dir("verf")).space)
 print(cp.describe())
 PY
 ```

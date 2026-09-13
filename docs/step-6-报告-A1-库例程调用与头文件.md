@@ -241,7 +241,7 @@ F800[64:88] == DDD4[48:72] : True
 
 1. **McpPlugin 只有在"模型已经跑起来"时才加载** ⇒ 裸跑 `./CasioEmuMsvc` 停在选机型界面时
    3001 端口根本不开。**把机型目录当位置参数传进去**即可：
-   `cd ~/casioemu && ./CasioEmuMsvc models/fx991cnxfVirtual`。
+   `cd <EMU_DIR> && ./CasioEmuMsvc models/fx991cnxfVirtual`。
 2. 本机 CasioEmuMsvc 的 GUI **不接收合成输入**（uinput 的绝对指针 moveto 有效、按键无效；
    XTest 也无效），所以"用鼠标点选机型"这条路走不通 —— 一切都要靠 MCP 工具本身完成。
 
@@ -249,9 +249,9 @@ F800[64:88] == DDD4[48:72] : True
 写 launcher 到 `0xD248` → 写账本 `0xD244=07` → 长按【→】【=】 → 读回 + 把屏幕缓冲区解码成点阵）：
 
 ```bash
-tools/rgcc --rom-dir ~/casioemu/models/fx991cnxfVirtual -I include --data-base D700 \
+tools/rgcc --rom-dir <VERF_MODEL_DIR> -I include --data-base D700 \
            examples/hello.c -o out/hello.bin --rop out/hello-Rop.bin
-tools/crop-verify --rom-dir ~/casioemu/models/fx991cnxfVirtual --bin out/hello.bin \
+tools/crop-verify --rom-dir <VERF_MODEL_DIR> --bin out/hello.bin \
                   --data-base D700 --expect D137=0E --screen DDD4 E3D4
 ```
 

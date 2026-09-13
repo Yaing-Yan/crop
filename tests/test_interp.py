@@ -10,6 +10,14 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+from crop.models import local, model_dir   # noqa: E402
+
+
+def _m(which):
+    try:
+        return model_dir(which)
+    except LookupError:
+        return ""
 
 from crop.chain import LEFT, RIGHT, ChainBuilder, encode_gadget, encode_value  # noqa: E402
 from crop.gadget import scan                                                  # noqa: E402
@@ -18,8 +26,15 @@ from crop.nxu16 import decode as _dec                                         # 
 from crop.rom import RomImage                                                 # noqa: E402
 from crop.ropdsl import compile_rop_dsl, load_rop_file, tokenize              # noqa: E402
 
-MODEL = os.path.expanduser("~/casioemu/models/fx991cnxfVirtual")
-ROPFILE = os.path.expanduser("~/Downloads/Pixel Editor 𝑷𝒓𝒐 - v1.1.rop")
+def _m(which):
+    try:
+        return model_dir(which)
+    except LookupError:
+        return ""
+
+
+MODEL = _m("verf")
+ROPFILE = (local("ropfile") or "")          # 参考 .rop（本机私有配置）
 
 # 项目期望.md 里给出的 Pixel Editor Pro v1.1 编译产物前 64 字节（真值）
 PIXEL_TRUTH = bytes.fromhex("".join("""

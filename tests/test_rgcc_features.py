@@ -13,6 +13,14 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+from crop.models import model_dir   # noqa: E402
+
+
+def _m(which):
+    try:
+        return model_dir(which)
+    except LookupError:
+        return ""
 
 from crop.chain import encode_gadget                       # noqa: E402
 from crop.gadget import scan                               # noqa: E402
@@ -24,7 +32,14 @@ from crop.rgcc import Backend, RgccError, compile_source     # noqa: E402
 from crop.rom import RomImage                               # noqa: E402
 from crop.ropvm import BRK_ADDR, LIFTED_PATH, run_rop_chain  # noqa: E402
 
-MODEL = os.path.expanduser("~/casioemu/models/fx991cnxfVirtual")
+def _m(which):
+    try:
+        return model_dir(which)
+    except LookupError:
+        return ""
+
+
+MODEL = _m("verf")
 HAVE_VM = os.path.isdir(MODEL) and os.path.isfile(LIFTED_PATH)
 
 

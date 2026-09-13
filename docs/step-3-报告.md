@@ -1,7 +1,7 @@
 # 第 3 步报告：rGCC v0（受限 C 子集 → 可 100% 翻译的 `.bin`）
 
 > 产物：`crop/rgcc.py`、`tools/rgcc`、`tests/test_rgcc.py`（自测共 25 项全绿）。
-> 跑法：`tools/rgcc --rom-dir ~/casioemu/models/fx991cnxfVirtual demo.c -o out/demo.bin --rop out/Rop.bin --dsl out/demo.rop`
+> 跑法：`tools/rgcc --rom-dir <VERF_MODEL_DIR> demo.c -o out/demo.bin --rop out/Rop.bin --dsl out/demo.rop`
 
 ## 一、为什么是"受限"子集：第 1、2 步给出的硬约束
 
@@ -67,7 +67,7 @@ void main(void) {
    "ER0 == ER2 → R0 = 1（否则 0）" gadget。配合 `0/1 索引 × 2 + 表基址` 与枢轴，
    就能做**跳转表式条件分支**（代价约 5~6 个槽/次，落在设计文档说的 128~1024 字节预算内）。
    实施前必须用模拟器把它的链契约（吃几字节、改哪些寄存器）实测确认。
-2. **ROP 模拟台**：用 `~/nxu16-decompiler/rom991cnx_lifted.py` 把生成的链放进 RAM 跑一遍，
+2. **ROP 模拟台**：用 `<LIFTED_PY>` 把生成的链放进 RAM 跑一遍，
    对比"直接执行 `.bin`"的最终寄存器/内存状态 —— 这才是端到端的正确性证明。
 3. **launcher（+2 法）**：目前只差 `FD 24 …` 那 2 字节的语义；有了模拟台就能实测确定，
    然后写 `launcher.conf`。
