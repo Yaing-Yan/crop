@@ -1101,6 +1101,30 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
             return ptr_addr(ref.var, line) + ref.offset
         raise RgccError("第 %d 行：地址要在运行时算（A4 的字节传送还没做）" % line)
 
+    def written_slots(stmts) -> set:
+        out = set()
+        for st in stmts:
+            if st.dst is not None and st.kind in ("assign", "copy"):
+                out.add(st.dst.value)
+            if st.body:
+                out |= written_slots(st.body)
+        return out
+
+    def subst_consts(stmts, const_slots: Dict[int, int]) -> List[Stmt]:
+        """把"源是已知常量槽"的搬运改写成常量赋值 —— 这样 codegen 的块写归并就能接手。"""
+        out: List[Stmt] = []
+        for st in stmts:
+            if (st.kind == "copy" and st.src is not None and st.src.kind == "const"
+                    and st.src.value in const_slots):
+                out.append(Stmt(kind="assign", dst=st.dst,
+                                value=const_slots[st.src.value], line=st.line))
+            elif st.kind in ("block", "loop") and st.body:
+                out.append(Stmt(kind=st.kind, body=subst_consts(st.body, const_slots),
+                                line=st.line))
+            else:
+                out.append(st)
+        return out
+
     def resolve(args, line: int = 0) -> List[Tuple[str, int]]:
         out: List[Tuple[str, int]] = []
         for k, v in args:
@@ -1146,6 +1170,8 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
                         raise RgccError("第 %d 行：%s 要 %d 个参数，给了 %d 个"
                                         % (st.line, st.name, len(fn.params), len(args)))
                     bind: Dict[str, int] = {}
+                    const_slots: Dict[int, int] = {}
+                    body_writes = written_slots(fn.body)
                     for (pname, ptype), (ak, av) in zip(fn.params, args):
                         slot = fn.scope[pname]
                         if ptype == "ptr":
@@ -1161,6 +1187,8 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
                         if ak == "const":
                             emit(backend.write_byte_imm(slot.addr, av),
                                  "%s ← %d（实参）" % (pname, av))
+                            if slot.addr not in body_writes:      # 体内没改过 → 可以常量代入
+                                const_slots[slot.addr] = av
                         else:
                             emit(backend.copy_var(slot.addr, av),
                                  "%s ← [%04X]（实参）" % (pname, av))
@@ -1169,7 +1197,7 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
                         fn.name, "".join("  %s=%04X" % (k, v) for k, v in bind.items())))
                     inline_stack.append(st.name)
                     ptr_stack.append(bind)
-                    gen(fn.body, fn.scope, fn, end)
+                    gen(subst_consts(fn.body, const_slots), fn.scope, fn, end)
                     ptr_stack.pop()
                     inline_stack.pop()
                     place(end)
