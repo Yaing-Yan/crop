@@ -41,6 +41,8 @@ def main() -> int:
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ap.add_argument("--labels", default=os.path.join(root, "labels.conf"),
                     help="标签表（库例程入口按签名逐 Ver 解析；默认仓库根的 labels.conf）")
+    ap.add_argument("--no-carrier", action="store_true",
+                    help="禁用字符串骑链，字符串改回写数据区（排查/兼容用）")
     ap.add_argument("--no-lib", action="store_true",
                     help="不用库表（此时调用库函数会报错）")
     ap.add_argument("--max-insns", type=int, default=8)
@@ -52,6 +54,9 @@ def main() -> int:
     db = scan(rom, max_insns=args.max_insns)
     try:
         backend = Backend(db)
+        if args.no_carrier:
+            backend.carrier_addr = backend.carrier_len = 0
+            backend.carrier_ins = b""
     except RgccError as e:
         print("后端不可用：%s" % e)
         return 2
