@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""crop-chars —— 从机型的"字符表.xlsx"生成 include/rchars.h。
+
+xlsx 就是 zip+XML，这里不依赖 openpyxl：直接解 sharedStrings + sheet1。
+表格约定：**行号 = 高半字节、列号 = 低半字节**（A 列是行号，B..Q 列对应 0..F）。
+用法：tools/crop-chars 一级字符表.xlsx > include/rchars.h
+"""
+from __future__ import annotations
+import re, sys, zipfile
+from xml.etree import ElementTree as ET
+
+
+def read_xlsx(path):
+    z = zipfile.ZipFile(path)
+    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    shared = []
+    if "xl/sharedStrings.xml" in z.namelist():
+        root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+        for si in root.findall(f"{ns}si"):
+            shared.append("".join(t.text or "" for t in si.iter(f"{ns}t")))
+    sheet = ET.fromstring(z.read("xl/worksheets/sheet1.xml"))
+    rows = []
+    for row in sheet.iter(f"{ns}row"):
+        cells = {}
+        for c in row.findall(f"{ns}c"):
+            ref = c.get("r", "")
+            col = re.match(r"([A-Z]+)", ref).group(1)
+            v = c.find(f"{ns}v")
+            if v is None:
+                continue
+            cells[col] = shared[int(v.text)] if c.get("t") == "s" else v.text
+        rows.append(cells)
+    return rows
+
+
+def main() -> int:
+    rows = read_xlsx(sys.argv[1])
+    # 第 1 行是列标题（B..Q = 0..F）；第 2 行起 A 列是行号
+    hi = {}
+    for col, val in rows[0].items():
+        if col != "A" and re.fullmatch(r"[0-9A-Fa-f]", str(val or "")):
+            hi[col] = int(val, 16)
+    table = {}
+    for r in rows[1:]:
+        a = str(r.get("A", "")).strip()
+        if not re.fullmatch(r"[0-9A-Fa-f]", a):
+            continue
+        for col, val in r.items():
+            if col in hi and val and val != "@":
+                table[(int(a, 16) << 4) | hi[col]] = str(val)
+    print("/* 由 tools/crop-chars 生成 —— 机型字库的**单字节**字符表（行=高半字节、列=低半字节）")
+    print(" * 注意：这台机器**不是 ASCII**！0x68 是 \"Abs(\" 而不是 'h'。")
+    print(" * 用法：rprint_at(30, 20, \"\\x31\\xA7\\x32\");   // 1+2  */")
+    print("#ifndef CROP_RCHARS_H")
+    print("#define CROP_RCHARS_H\n")
+    seen = set()
+    for code in sorted(table):
+        name = table[code]
+        ident = re.sub(r"[^0-9A-Za-z]", "", name).upper() or "S%02X" % code
+        if not ident[0].isalpha():
+            ident = "N" + ident
+        if ident in seen:
+            ident = "%s_%02X" % (ident, code)
+        seen.add(ident)
+        print("#define RC_%-10s 0x%02X   /* %s */" % (ident, code, name))
+    print("\n#endif /* CROP_RCHARS_H */")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
