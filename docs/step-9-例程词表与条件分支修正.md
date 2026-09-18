@@ -77,3 +77,34 @@ VerC: 解析成功 51 条，缺失 6（VerF 专属/签名不同，可后续单�
 这三样正是待补的 A7/A4 —— 所以现在编译会明确报错（而不是生成错链）。
 按第 2 节把 `er0>er2?` + 计算跳转接上以后，它就能真正跑起来；
 在那之前，仓库里保留这个样例作为**编译器能力的验收目标**。
+
+---
+
+## 5. 本轮已落地 & 下一步（交接说明）
+
+**已落地**
+
+* `tools/crop-import`：把 RopIDE 的 gadget 表（JSON）导入 `labels.conf`（签名现场反汇编）；
+  VerF 57 条全中、VerC 51 条（6 条待补）。
+* `rprint_at(x, y, text)` → **`print-0x1y`**（`0x0828A`，x/y 独立）⇒ 真正居中；
+  `examples/hello_world.c` 改为 `rprint_at(30, 20, "hello world!")`（x=(192−12×11)/2）。
+* 仓库内已写入 git 身份与 push 代理（`git config user.name/user.email/http(s).proxy`），
+  以后直接 `git push` 即可（走 `127.0.0.1:1081`）。
+
+**下一步（按收益排序，均已定位到实现点）**
+
+1. **字符串骑链（省掉整块初值写入，114 → ~70 字节）**
+   * 现状：字符串先放进数据区（`--data-base` 之后），再用块写 gadget 写进 RAM ⇒ 每 8 字节付 34 字节；
+   * 目标：把字符串**直接作为链上的内联数据**（`POP QRn` 的 payload 本来就落在链里 = RAM），
+     把 `ER2` 指向**那个链地址**即可，完全不用拷贝；
+   * 实现：rGCC 侧对 `"..."` 参数发射一个新的标记块（例如 `POP QRn` + payload + 一个
+     "取该 payload 地址"的伪指令）；解释器侧用 `ChainBuilder.anchor()` 记录 payload 的
+     链地址，并把 ER2 的值编成**前向引用**（`cb.value_expr("$Lxxxx")`，机制现成）。
+2. **块写 pad 归零**：`Backend` 改为按"pad 最小、有效字节最多"挑块写 gadget
+   （现在固定选 `0x17DE8`，尾巴 `POP QR8 ; POP XR4 ; POP PC` = 白付 12 字节）。
+3. **`--recommandly-simpler` 极致模式**：借字节 / 共槽 / 尾调用，参考用户给的
+   `Pixel Editor Lite - v1.1.rop`；作为显式开关，默认关（保证可读与可验证）。
+4. **A7 重开**：把 `er0>er2?`（比较→0/1，`0x0B61E`）、`switch-case`（`0x08F10`）、
+   `jump-q8`/`jump-e14` 接成解释器 L4 条件分支；rGCC 端加 `if (a > b)` / `while (a > b)`，
+   之后 `examples/bubble_sort.c` 才有望真正跑起来。
+5. 补 VerC 缺的 6 条签名（`labels.conf` 里以 VerF 提示地址写的那些，逐条看 VerC 的等价形态）。
