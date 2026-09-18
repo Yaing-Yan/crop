@@ -67,6 +67,11 @@ LIBFUNCS: Tuple[LibFunc, ...] = (
              Param("text", "ER2", "u16", ptr=True)),
             "在屏幕缓冲区打印一行文字：font 字体(0x0E 正常/0x0A 小/0x08 表格小)、"
             "row 纵向像素行、text 字符串地址"),
+    LibFunc("rprint_at", "print-0x1y",
+            (Param("x", "R0", "u8"), Param("y", "R1", "u8"),
+             Param("text", "ER2", "u16", ptr=True)),
+            "在像素坐标 (x, y) 处打印一行文字：x 0..191、y 0..63（这个入口 x/y 独立，"
+            "所以能真正居中）"),
     LibFunc("rrefresh", "refresh", (),
             "把屏幕缓冲区刷新到显存（并提交）"),
     LibFunc("rclear", "clear", (),

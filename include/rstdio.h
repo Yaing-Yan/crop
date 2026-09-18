@@ -42,6 +42,14 @@
  *  @param text 以 0 结尾的字符串地址（字符串常量由编译器放进只读数据区） */
 void rprint(unsigned char font, unsigned char row, const unsigned char *text);
 
+/*: 在像素坐标 (x, y) 处打印一行文字。
+ *  与 rprint 的区别：这个入口 **x 与 y 独立**（x 0..191、y 0..63），所以能精确居中，
+ *  例如 192 像素宽、字体 0x0E 每字 11 像素、"hello world!" 12 字 ⇒ x=(192-132)/2=30。 */
+void rprint_at(unsigned char x, unsigned char y, const unsigned char *text);
+
+/*: 常用居中：把 12 字左右的短句放在屏幕正中（y=20） */
+#define RPRINT_CENTER(text) rprint_at(30, 20, text)
+
 /*: 把屏幕缓冲区刷新到显存（并提交给显示控制器） */
 void rrefresh(void);
 
