@@ -15,10 +15,11 @@
 #include "rstdlib.h"
 
 void main(void) {
-    rscreen_on();
-    rclear();
-    rprint_at(30, 20, "hello world!");   /* x=(192-12*11)/2=30：真正居中 */
-    rrefresh();
+    rscreen_on();                        /* 开显示（不开的话屏幕不会有任何输出） */
+    rclear();                            /* 清屏幕缓冲区 */
+    rprint_at(30, 20, "hello world!");   /* x=(192-12*11)/2=30：居中打印 */
+    rrefresh();                          /* 刷到显存 */
     while (1) {
     }
+}
 }

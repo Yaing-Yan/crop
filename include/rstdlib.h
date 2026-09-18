@@ -15,6 +15,13 @@
 #ifndef CROP_RSTDLIB_H
 #define CROP_RSTDLIB_H
 
+/*: 关中断 —— 想在屏上**留住**画面时必须先调它：
+ *  链跑完停在 while(1) 时，计算器的 OS 仍在中断里跑显示任务，会把屏幕重画回它自己的状态。 */
+void rint_off(void);
+
+/*: 开中断 */
+void rint_on(void);
+
 /*: 开启屏幕显示 —— **必须最先调用**：不打开显示的话，画进屏幕缓冲区的东西不会出现在屏上。
  *  对应 ROM 例程（VerF `0x0937C` / VerC `0x09310`，以 `RT` 结尾，编译器自动配 rt-fix）。 */
 void rscreen_on(void);
