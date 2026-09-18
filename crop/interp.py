@@ -206,6 +206,8 @@ def translate(db: GadgetDB, code: bytes, opts: Optional[Options] = None) -> Resu
         cb.raw(b)
         dsl.append(b.hex().upper())
 
+    last_anchor: List[Optional[str]] = [None]      # 最近一个"骑链字符串"的锚点名
+    carrier_addrs: List[str] = []                  # 所有骑链字符串的锚点（按出现顺序）
     i = 0
     while i < len(insns):
         ins = insns[i]
@@ -249,7 +251,30 @@ def translate(db: GadgetDB, code: bytes, opts: Optional[Options] = None) -> Resu
             i += hit.ninsn
             continue
 
-        # ---------------- 取数原语（POP <reg>）：链数据就在 .bin 里紧跟其后 ----
+        # ---------------- 内联数据载体（字符串骑链）：整块吃字节、不写内存 ----------------
+        cm = getattr(db, "carrier_marker", None)
+        if cm and code.startswith(cm[0], ins.addr) and len(code) >= ins.addr + len(cm[0]) + cm[1]:
+            payload = bytes(code[ins.addr + len(cm[0]):ins.addr + len(cm[0]) + cm[1]])
+            caddr = sorted(a for a, g in db.by_addr.items()
+                           if g.inline_safe and b"".join(i.raw for i in db.rebuild(a).insns[:-1]) == cm[0]
+                           and g.data_bytes == cm[1])
+            if caddr:
+                gslot(caddr[0])
+                name = "P%04X" % len(cb.buf)
+                carrier_addrs.append(name)
+                last_anchor[0] = name
+                cb.anchor(name, opts.pivot_side)
+                dsl.append("<%s%s>" % ("-" if opts.pivot_side == LEFT else "", last_anchor[0]))
+                dsl.append("// %04X: 内联数据载体（%d 字节）→ 记为 %s"
+                           % (ins.addr, cm[1], last_anchor[0]))
+                graw(payload)
+                stats["l1"] += 1
+                stats["blocks"] += 1
+                decisions.append(Decision(ins.addr, len(cm[0]) + cm[1], "block",
+                                          "内联数据载体 %d 字节" % cm[1], 4 + cm[1], caddr[0]))
+                while i < len(insns) and insns[i].addr < ins.addr + len(cm[0]) + cm[1]:
+                    i += 1
+                continue
         # 约定：`.bin` 中 ``POP <reg>`` 之后紧跟该指令要弹走的 ``sp_delta`` 个字节，
         # 由解释器原样搬进 ROP 链（这正是"任意常量"的来源）。
         if ins.cls == "pop_data":
@@ -263,6 +288,20 @@ def translate(db: GadgetDB, code: bytes, opts: Optional[Options] = None) -> Resu
             nbytes = ins.sp_delta
             end = ins.addr + ins.size + nbytes
             payload = bytes(code[ins.addr + ins.size:end])
+            sent = payload[0] | (payload[1] << 8) if len(payload) >= 2 else -1
+            if (sent & 0xFF00) == 0x8000 and (sent & 0xFF) < len(carrier_addrs):
+                name = carrier_addrs[sent & 0xFF]
+                dsl.append("// %04X: %s ← 哨兵 → 骑链字符串 $%s" % (ins.addr, ins.text, name))
+                gslot(pick(addrs, low00))
+                gvalue("$%s" % name)
+                stats["l1"] += 1
+                stats["blocks"] += 1
+                decisions.append(Decision(ins.addr, 2, "pop_block",
+                                          "哨兵 → %s" % name, 6, None))
+                i += 1
+                while i < len(insns) and insns[i].addr < end:
+                    i += 1
+                continue
             if len(payload) < nbytes:
                 stats["unsupported"] += 1
                 decisions.append(Decision(ins.addr, ins.size, "unsupported",

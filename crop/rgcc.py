@@ -95,6 +95,10 @@ class Backend:
     var_load: Dict[str, Tuple[int, bytes]] = field(default_factory=dict)
     #: 空操作间隔（``MOV Rn, Rn``，无副作用、以 POP PC 结尾）：用来把相邻的搬运动作隔开
     noop_ins: bytes = b""
+    #: 内联数据载体：链上"只吃字节"的 gadget（字符串骑链用）
+    carrier_addr: int = 0
+    carrier_ins: bytes = b""
+    carrier_len: int = 0
 
     def __post_init__(self) -> None:
         self._derive()
@@ -193,6 +197,14 @@ class Backend:
             got = self._single("POP %s" % reg)
             if got:
                 self.pop_gad[reg] = (got[0], got[1])
+
+        # ---- 内联数据载体（字符串骑链）：纯吃链字节的 gadget ----
+        from .libabi import find_carrier
+        try:
+            self.carrier_addr, self.carrier_ins, self.carrier_len = find_carrier(self.db)
+            self.db.carrier_marker = (self.carrier_ins, self.carrier_len)   # 给 verify_translatable 用
+        except Exception:
+            pass
 
         # ---- 空操作 gadget（间隔用）：MOV Rn, Rn ----
         for cand in ("MOV R7, R7", "MOV R1, R1", "MOV R0, R0", "MOV R8, R8"):
@@ -1062,13 +1074,19 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
     globals_, main_body = parser.parse()
 
     # ---- 初值/字符串常量：放在所有变量之后（留 8 字节避开块写的 2 字节溢出）----
+    # 说明：字符串常量现在**骑在链上**（用内联数据载体 gadget），不再写进数据区；
+    # 只有"放不下载体"的长字符串才回退到旧的"数据区 + 块写"路径。
     str_addr: Dict[int, int] = {}
     data: Dict[int, bytes] = dict(parser.initials)
+    fallback: Dict[int, int] = {}
     at = (parser.next_addr + 8) & ~1
-    for s in parser.strings:
-        str_addr[parser._str_ids[s]] = at
-        data[at] = s + b"\x00"
-        at = (at + len(s) + 2) & ~1
+    for raw in parser.strings:
+        if backend.carrier_len and len(raw) + 1 <= backend.carrier_len:
+            continue                                   # 走载体（骑链）
+        fallback[parser._str_ids[raw]] = at
+        data[at] = raw + b"\x00"
+        at = (at + len(raw) + 2) & ~1
+    str_addr = fallback
 
     code = bytearray()
     listing: List[str] = []
@@ -1137,10 +1155,29 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
                 out.append(st)
         return out
 
+    def idx_fits(idx: int) -> bool:
+        return len(parser.strings[idx]) + 1 <= backend.carrier_len
+
+    pending_carriers: List[int] = []
+
+    def emit_carriers() -> None:
+        """把"骑链字符串"统一放在**程序末尾**：ROM 例程的栈帧只占 SP 以下的已走链段，
+        链尾在 SP 之上，不会被踩。"""
+        for idx in pending_carriers:
+            raw = parser.strings[idx] + b"\x00"
+            payload = raw + b"\x00" * (backend.carrier_len - len(raw))
+            emit(backend.carrier_ins + payload,
+                 "字符串骑链 #%d @载体%05X ← %r" % (idx, backend.carrier_addr, raw[:-1]))
+
     def resolve(args, line: int = 0) -> List[Tuple[str, int]]:
         out: List[Tuple[str, int]] = []
         for k, v in args:
             if k == "str":
+                if backend.carrier_len and idx_fits(v):
+                    if v not in pending_carriers:
+                        pending_carriers.append(v)
+                    out.append(("const", 0x8000 | pending_carriers.index(v)))   # 哨兵
+                    continue
                 out.append(("const", str_addr[v]))
             elif k == "ptrparam":
                 out.append(("const", ptr_addr(v, line)))
@@ -1300,6 +1337,7 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
             i += 1
 
     gen(main_body, globals_, parser.main, None)
+    emit_carriers()                                  # 骑链字符串放在最后
 
     # 回填跳转（B 是 4 字节绝对地址：低字节在先）
     for at2, lid in fixups:
@@ -1341,8 +1379,12 @@ def verify_translatable(code: bytes, db: GadgetDB, routines: Sequence = ()) -> N
     ``.bin`` 里出现的是"入口到结尾"的整段字节，所以这里也要按整段识别。
     """
     by_code = {r.code: r for r in routines}
+    carrier = getattr(db, "carrier_marker", b"")
     a = 0
     while a + 2 <= len(code):
+        if carrier and code.startswith(carrier[0], a) and len(code) >= a + len(carrier[0]) + carrier[1]:
+            a += len(carrier[0]) + carrier[1]          # 内联数据载体：整块跳过
+            continue
         hit = None
         for c, r in by_code.items():
             if code.startswith(c, a):

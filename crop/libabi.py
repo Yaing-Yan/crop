@@ -81,6 +81,37 @@ LIBFUNCS: Tuple[LibFunc, ...] = (
 )
 
 
+def find_carrier(db, want: int = 16):
+    """找一个"纯吃链字节"的 gadget 当内联数据载体。
+
+    要求：inline_safe（结尾 POP PC、不碰 SP、不写内存）、体内只有 POP/MOV、
+    且一次吃 ``want`` 字节（VerF 实测 ``0x22390: POP QR8 ; POP QR0 ; POP PC`` 吃 16 字节）。
+    返回 ``(addr, insn_bytes_without_terminator, payload_len)``。
+    """
+    best = None
+    for a in sorted(db.by_addr):
+        g = db.by_addr[a]
+        if not g.inline_safe or g.data_bytes < 8:
+            continue
+        ins = db.rebuild(a).insns
+        ok = True
+        for i in ins[:-1]:
+            if i.cls == "pop_data":
+                continue
+            if i.mnemonic == "MOV" and "[EA" not in i.operands and "[" not in i.operands:
+                continue
+            ok = False
+            break
+        if not ok:
+            continue
+        cand = (g.data_bytes, a, b"".join(i.raw for i in ins[:-1]))
+        if best is None or cand[0] > best[0]:
+            best = cand
+    if best is None:
+        raise LibError("ROM 里没有可用的内联数据载体 gadget")
+    return best[1], best[2], best[0]
+
+
 class Library:
     """某个 ROM 上的库例程集合 + 参数搬运。"""
 

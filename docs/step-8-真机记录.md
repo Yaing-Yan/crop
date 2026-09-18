@@ -34,6 +34,15 @@ cd <EMU_DIR> && ./CasioEmuMsvc models/<VERF_MODEL_DIR>
    出错的一环，`b = a` 读回 7 就是它的直接证据；
 3. 变量区 `0xD700` 在这台机器上可用（先前"写不进去"的结论是**没触发**造成的假象）。
 
+## 1''. `examples/hello_world.c` —— ✅ 通过（round 12+，链压到 66 字节）
+
+```
+rscreen_on() → rclear() → rprint_at(30,20,"hello world!") → rrefresh() → while(1)
+链 66 字节 @0xD400（字符串骑链，不再写数据区）；两个 ROM 版本编出来都是 66 字节
+真机：D137=0E；0xDDD4 非零 119 字节，解码 = HELLO WORLD!；F800 两处副本比对为 True
+按键：MCP keyboard_code 长按 1.2s（权限授予后可用）；用完已 resume
+```
+
 ## 2. `examples/rstring.c` —— **之前的"✗"部分是核对地址写错了**（round 21 更正）
 
 **教训**：`#include` 写在最前面 ⇒ 头文件里那些函数的**形参槽先被分配**，
