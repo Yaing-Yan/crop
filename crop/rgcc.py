@@ -95,6 +95,7 @@ class Backend:
     var_load: Dict[str, Tuple[int, bytes]] = field(default_factory=dict)
     #: 空操作间隔（``MOV Rn, Rn``，无副作用、以 POP PC 结尾）：用来把相邻的搬运动作隔开
     noop_ins: bytes = b""
+    blk_pad: int = 0                  # 块写 gadget 尾巴里额外吃掉的链字节数
     #: 内联数据载体：链上"只吃字节"的 gadget（字符串骑链用）
     carrier_addr: int = 0
     carrier_ins: bytes = b""
@@ -135,7 +136,10 @@ class Backend:
             raise RgccError("ROM 里找不到「POP XRn/QRn + ST Rn+2,[ERn]」原语对，"
                             "无法生成常量写内存")
 
-        # 块写：从 ROM 里扫"LEA [ERk] 紧跟 ST QRm,[EA+]"的 gadget（一次槽写多字节）
+        # 块写：从 ROM 里扫"LEA [ERk] 紧跟 ST QRm,[EA+]"的 gadget（一次槽写多字节）。
+        # ★按"代价 = pad 字节 + 一次写入不足 8 字节的惩罚"排序挑**最省**的那个：
+        #   尾巴里的 POP 越多 ⇒ 链上要补的 0 越多（原来是固定取第一个，白付 12 字节）。
+        cands = []
         for a in sorted(self.db.by_addr):
             g = self.db.by_addr[a]
             if g.term != "pop_pc" or g.ninsn == 0:
@@ -151,19 +155,28 @@ class Backend:
                 preg, qreg = "ER%d" % reg, "QR%d" % qr
                 if preg not in pops or qreg not in pops:
                     continue
-                self.blk_pop = self._single("POP %s" % qreg)[1]     # 值装载
-                self.blk_pop_len = self._single("POP %s" % qreg)[2].sp_delta
-                self.blk_base = self._single("POP %s" % preg)[1]    # 目标地址装载
-                # ★入口必须是 "LEA [ERk]" 这条指令本身，而不是外层 gadget 的起点：
-                #   起点之前的 L QR0,[EA+]/L ER8,[EA+] 会用垃圾 EA 读数据，
-                #   把我们刚装进 R0..R9 的值冲掉（真机实测踩过这个坑）。
-                start = ins[k].addr - a
-                self.blk_gadget_addr = ins[k].addr
-                self.blk_body = g.code[start:-2]                   # 去掉结尾 POP PC
-                self.blk_qr, self.blk_base_reg = qr, preg
-                break
-            if self.blk_pop:
-                break
+                pad = sum(x.sp_delta for x in ins[k + 1:-1])   # 尾巴里额外吃掉的链字节
+                stores = sum(1 for x in ins[k + 1:] if x.text.startswith("ST"))
+                # ★安全优先：只有"写 8 字节 + 2 字节尾巴"这种**足迹可预测**的形态才低分；
+                #   连写多段的 gadget（如 0x17E7E 会一路写 30 字节）虽然 pad=0，但会踩到
+                #   后面 20 字节的数据 ⇒ 给很高的惩罚，避免悄悄改坏别的变量。
+                cands.append((pad + (0 if stores == 2 else 40), pad, stores, g, ins, k,
+                              qr, preg))
+        if cands:
+            cands.sort(key=lambda c: (c[0], c[1], c[3].addr))
+            score, pad, stores, g, ins, k, qr, preg = cands[0]
+            qreg = "QR%d" % qr
+            self.blk_pop = self._single("POP %s" % qreg)[1]     # 值装载
+            self.blk_pop_len = self._single("POP %s" % qreg)[2].sp_delta
+            self.blk_base = self._single("POP %s" % preg)[1]    # 目标地址装载
+            # ★入口必须是 "LEA [ERk]" 这条指令本身，而不是外层 gadget 的起点：
+            #   起点之前的 L QR0,[EA+]/L ER8,[EA+] 会用垃圾 EA 读数据，
+            #   把我们刚装进 R0..R9 的值冲掉（真机实测踩过这个坑）。
+            start = ins[k].addr - g.addr
+            self.blk_gadget_addr = ins[k].addr
+            self.blk_body = g.code[start:-2]                    # 去掉结尾 POP PC
+            self.blk_qr, self.blk_base_reg = qr, preg
+            self.blk_pad = pad
 
         # 变量槽：同时有 L 与 ST 的 (寄存器,偏移,基址)
         slots = {}
@@ -252,6 +265,7 @@ class Backend:
             raise RgccError("块写一次最多 %d 字节" % self.blk_pop_len)
         b = addr & 0xFFFF
         data = bytes(v & 0xFF for v in values) + b"\x00" * (self.blk_pop_len - len(values))
+        # pad 由**解释器**在链上补（它知道 gadget 尾巴吃多少字节），这里不要重复补
         return (self.blk_base + bytes([b & 0xFF, (b >> 8) & 0xFF])
                 + self.blk_pop + data + self.blk_body)
 
@@ -1074,16 +1088,31 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
     globals_, main_body = parser.parse()
 
     # ---- 初值/字符串常量：放在所有变量之后（留 8 字节避开块写的 2 字节溢出）----
+    def _strs_for_userfuncs(stmts, out):
+        for st in stmts:
+            if st.kind == "call" and st.name in parser.funcs:
+                if st.name in parser.funcs:
+                    for k, v in st.args:
+                        if k == "str":
+                            out.add(v)
+            if st.body:
+                _strs_for_userfuncs(st.body, out)
+        return out
+
+    need_data: set = set()
+    for fn in list(parser.funcs.values()):
+        _strs_for_userfuncs(fn.body, need_data)
+
     # 说明：字符串常量现在**骑在链上**（用内联数据载体 gadget），不再写进数据区；
     # 只有"放不下载体"的长字符串才回退到旧的"数据区 + 块写"路径。
     str_addr: Dict[int, int] = {}
     data: Dict[int, bytes] = dict(parser.initials)
     fallback: Dict[int, int] = {}
     at = (parser.next_addr + 8) & ~1
-    for raw in parser.strings:
-        if backend.carrier_len and len(raw) + 1 <= backend.carrier_len:
+    for idx, raw in enumerate(parser.strings):
+        if (idx not in need_data) and backend.carrier_len and len(raw) + 1 <= backend.carrier_len:
             continue                                   # 走载体（骑链）
-        fallback[parser._str_ids[raw]] = at
+        fallback[idx] = at
         data[at] = raw + b"\x00"
         at = (at + len(raw) + 2) & ~1
     str_addr = fallback
@@ -1169,11 +1198,11 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
             emit(backend.carrier_ins + payload,
                  "字符串骑链 #%d @载体%05X ← %r" % (idx, backend.carrier_addr, raw[:-1]))
 
-    def resolve(args, line: int = 0) -> List[Tuple[str, int]]:
+    def resolve(args, line: int = 0, allow_carrier: bool = True) -> List[Tuple[str, int]]:
         out: List[Tuple[str, int]] = []
         for k, v in args:
             if k == "str":
-                if backend.carrier_len and idx_fits(v):
+                if allow_carrier and backend.carrier_len and idx_fits(v):
                     if v not in pending_carriers:
                         pending_carriers.append(v)
                     out.append(("const", 0x8000 | pending_carriers.index(v)))   # 哨兵
@@ -1215,7 +1244,7 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
                                         % (st.line, st.name))
                     if len(inline_stack) >= 6:
                         raise RgccError("第 %d 行：内联层数太深（>6）" % st.line)
-                    args = resolve(st.args, st.line)
+                    args = resolve(st.args, st.line, allow_carrier=False)
                     if len(args) != len(fn.params):
                         raise RgccError("第 %d 行：%s 要 %d 个参数，给了 %d 个"
                                         % (st.line, st.name, len(fn.params), len(args)))
