@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""crop-import —— 把 RopIDE 风格的 gadget 表（JSON: name/addr/desc）导入 labels.conf。
+
+签名**从 ROM 现场反汇编**得到（前 3~4 条指令），所以同一个名字换 Ver 也能按签名重新解析。
+用法：tools/crop-import --rom-dir <机型目录> gadgets.json [labels.conf]
+"""
+from __future__ import annotations
+import argparse, json, os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from crop.nxu16 import decode as dec            # noqa: E402
+from crop.rom import RomImage                   # noqa: E402
+
+
+def signature(space, addr, n=4):
+    out, b = [], addr
+    for _ in range(n):
+        i = dec.decode_at(space, b)
+        if i is None:
+            break
+        out.append(i)
+        b += i.size
+        if i.cls in ("term_pop_pc", "ret", "jump", "call"):
+            break
+    # BL / B 的目标地址会随 Ver 变 → 通配
+    sig = []
+    for i in out:
+        t = i.text
+        if i.cls in ("call", "jump") and (":" in i.operands):
+            t = i.mnemonic + " *"
+        sig.append(t)
+    return sig
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("json")
+    ap.add_argument("--rom-dir", required=True)
+    ap.add_argument("--labels", default=os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "labels.conf"))
+    ap.add_argument("--only", default="", help="只导入名字里含这些子串的（逗号分隔）")
+    args = ap.parse_args()
+
+    rom = RomImage.auto(args.rom_dir)
+    items = json.load(open(args.json, encoding="utf-8"))
+    have = set()
+    lines = []
+    if os.path.isfile(args.labels):
+        for raw in open(args.labels, encoding="utf-8"):
+            if "=" in raw and not raw.strip().startswith("//"):
+                have.add(raw.split("=")[0].strip())
+            lines.append(raw.rstrip("\n"))
+    pick = [s for s in args.only.split(",") if s]
+    added = 0
+    for it in items:
+        name = it.get("name")
+        if not name or name in have:
+            continue
+        if pick and not any(p in name for p in pick):
+            continue
+        addr = int(str(it["addr"]), 16)
+        sig = signature(rom.space, addr)
+        if not sig:
+            continue
+        desc = (it.get("desc") or "").replace("\n", " / ").replace("#", "＃")
+        lines.append("%-14s = %05X | %s   // %s" % (name, addr, " ; ".join(sig), desc))
+        added += 1
+    open(args.labels, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+    print("导入 %d 条到 %s" % (added, args.labels))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
