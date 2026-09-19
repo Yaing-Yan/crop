@@ -71,11 +71,11 @@ class TestFeatures(unittest.TestCase):
         cu = self.c('unsigned char msg[8] = "HELLO";\nvoid main(void){ while(1){} }\n')
         self.assertEqual(cu.initials[cu.vars["msg"].addr], b"HELLO\x00")
 
-    def test_variable_index_is_refused_with_a_clear_message(self):
-        with self.assertRaises(RgccError) as cm:
-            self.c("unsigned char a[4];\nunsigned char i;\n"
-                   "void main(void){ a[i] = 1; while(1){} }\n")
-        self.assertIn("常量", str(cm.exception))
+    def test_variable_index_is_supported_now(self):
+        """A4：v[i]（i 是变量）现在可以编译。"""
+        cu = self.c("unsigned char v[4];\nunsigned char i;\nunsigned char t;\n"
+                    "void main(void){ i = 2; t = v[i]; v[1] = t; }\n")
+        self.assertGreater(len(cu.code), 0)
 
     def test_index_out_of_range(self):
         with self.assertRaises(RgccError):
@@ -141,7 +141,8 @@ class TestFeatures(unittest.TestCase):
                     ' rput16(msg, 65, 66); t = msg[0]; rhalt(); }\n')
         self.assertIn("rcopy4", cu.funcs)
         self.assertIn("rfill4", cu.funcs)
-        self.assertIn("rhalt", cu.funcs)
+        # rhalt 现在是**库例程**（冻结到 ROM 之外），不再是被内联的 C 函数
+        self.assertNotIn("rhalt", cu.funcs)
         res = translate(self.db, cu.code, Options(left_base=0xEC00))
         self.assertEqual(res.stats["unsupported"], 0, res.report())
 

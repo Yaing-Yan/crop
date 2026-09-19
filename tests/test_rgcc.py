@@ -131,7 +131,8 @@ class TestRgcc(unittest.TestCase):
 
     def test_unsupported_constructs_report_clearly(self):
         for src, frag in [
-            ("unsigned char x;\nvoid main(void){ if (1) { x = 1; } }\n", "条件分支"),
+            ("unsigned char x;\nvoid main(void){ if (1) { x = 1; } }\n", "期望 id"),
+            ("unsigned char x;\nunsigned char y;\nvoid main(void){ x = y * 2; }\n", "算术"),
             ("unsigned char x;\nvoid main(void){ while (x) { x = 1; } }\n", "while"),
             ("unsigned char x;\nvoid main(void){ x = 300; }\n", "0..255"),
             ("unsigned char x;\nvoid main(void){ x = 300; }\n", "0..255"),

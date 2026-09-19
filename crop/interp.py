@@ -48,6 +48,12 @@ class Options:
     right_base: int = 0xD3C0       # 右侧地址基准
     routines: Sequence = ()        # ROM 例程（crop/routines.py）：在 .bin 里出现即发一个链槽
     rt_push: Optional[object] = None   # rt-fix 原语（给以 RT 结尾的例程用）
+    #: 裸跳转表：.bin 偏移 → 20 位目标地址（在该处直接发一个链槽，不走指令流）
+    raw_jumps: Dict[int, int] = field(default_factory=dict)
+    #: A7 条件跳转标记：.bin 偏移 → 种类（if/else/end）
+    a7_markers: Dict[int, str] = field(default_factory=dict)
+    #: 内联数据载体 (指令字节, payload 字节数)：字符串骑链时用它识别
+    carrier: Optional[Tuple] = None      # (指令字节, payload 字节数[, 载体地址])
 
 
 @dataclass
@@ -208,65 +214,168 @@ def translate(db: GadgetDB, code: bytes, opts: Optional[Options] = None) -> Resu
 
     last_anchor: List[Optional[str]] = [None]      # 最近一个"骑链字符串"的锚点名
     carrier_addrs: List[str] = []                  # 所有骑链字符串的锚点（按出现顺序）
+    marker_offsets = set()                      # 冻结/裸跳转标记 DE AD 的出现位置
+    _k = 0
+    while True:
+        _k = code.find(b"\xDE\xAD", _k)
+        if _k < 0:
+            break
+        marker_offsets.add(_k)
+        _k += 1
+    carrier_offsets = set()
+    _cm0 = getattr(opts, "carrier", None) or getattr(db, "carrier_marker", None)
+    if _cm0:
+        _k = 0
+        while True:
+            _k = code.find(_cm0[0], _k)
+            if _k < 0:
+                break
+            carrier_offsets.add(_k)
+            _k += 1
+    # ---- A7：条件跳转所需的例程/槽（从 ROM 现场解析）----
+    a7 = {}
+    try:
+        from .libabi import Library as _Lib  # noqa: F401
+    except Exception:
+        pass
+    def _a7_addr(name):
+        for r in (getattr(opts, "routines", ()) or ()):
+            if getattr(r, "name", "") == name:
+                return r.entry
+        return None
+    a7["table"] = _a7_addr("er0-table")          # ER0 = R0*R2 + ER4
+    a7["er2"] = _a7_addr("er2-from-er0b")        # ER2 = ER0（带 8 字节填充）
+    a7["store"] = 0x08F94                        # ST ER2,[ER8] ; POP XR8 ; POP PC（吃 4）
+    a7["pivot"] = None
+    if jump_pair:
+        a7["pivot"] = jump_pair[2].addr
+    if_id = [0]
+    if_stack: List[int] = []
+    carrier_offsets = set()
+    _cm0 = getattr(opts, "carrier", None) or getattr(db, "carrier_marker", None)
+    if _cm0:
+        _k = 0
+        while True:
+            _k = code.find(_cm0[0], _k)
+            if _k < 0:
+                break
+            carrier_offsets.add(_k)
+            _k += 1
+    marker_offsets = set()
+    for _pat in (b"\xDE\xAD", b"\xDE\xAF", b"\xDE\xB0", b"\xDE\xB1"):
+        _k = 0
+        while True:
+            _k = code.find(_pat, _k)
+            if _k < 0:
+                break
+            marker_offsets.add(_k)
+            _k += 1
     i = 0
     while i < len(insns):
         ins = insns[i]
-        if ins.addr in labels:
-            name = labels[ins.addr]
-            cb.anchor(name, opts.pivot_side)
-            dsl.append("<%s%s>" % ("-" if opts.pivot_side == LEFT else "", name))
-            stats["anchors"] += 1
-            decisions.append(Decision(ins.addr, 0, "anchor", name))
-
-        # ---------------- ROM 例程调用（A1）---------------------------------
-        # `.bin` 里出现"某个 ROM 例程从入口到结尾的整段字节" → 发一个链槽跳过去。
-        # 以 ``RT`` 结尾的例程还要先发一个 rt-fix 槽（把"回来后继续吃链"压进硬件返回栈）。
-        hit = None
-        for r in routs:
-            if code.startswith(r.code, ins.addr):
-                hit = r
-                break
-        if hit is not None:
-            if hit.needs_push and rt_push is None:
-                stats["unsupported"] += 1
-                decisions.append(Decision(ins.addr, len(hit.code), "unsupported",
-                                          "例程 %s（RT 结尾）缺少 rt-fix 原语" % hit.name))
-                i += hit.ninsn
-                continue
-            if hit.needs_push:
-                dsl.append("// %04X: 例程 %s @%05X 以 RT 结尾 → 先 rt-fix @%05X"
-                           % (ins.addr, hit.name, hit.entry, rt_push.addr))
-                gslot(rt_push.addr)
-                stats["lib"] += 1
+        # ---- A7：if 的条件跳转（R0 = 0/1）→ 自改链值 + 枢轴 ----
+        if ins.addr in labels:                      # ANCHOR_GEN：程序内部跳转目标落锚点
+            cb.anchor(labels[ins.addr], opts.pivot_side)
+            dsl.append("<%s%s>" % ("-" if opts.pivot_side == LEFT else "", labels[ins.addr]))
+        _a7k = getattr(opts, "a7_markers", {}).get(ins.addr)
+        if _a7k and ins.addr in labels:            # A7mark_anchor：内部跳转目标落锚点
+            cb.anchor(labels[ins.addr], opts.pivot_side)
+            dsl.append("<%s%s>" % ("-" if opts.pivot_side == LEFT else "", labels[ins.addr]))
+        if _a7k == "if":
+            if a7["table"] and a7["er2"] and a7["pivot"]:
+                if_id[0] += 1
+                n = if_id[0]
+                if_stack.append(n)                 # ★嵌套也能对上：DE B0/B1 用栈顶
+                tn, en, vn = "T%d" % n, "E%d" % n, "V%d" % n
+                dsl.append("// %04X: if 条件跳转 #%d（R0=0/1）" % (ins.addr, n))
+                # ★不需要自改链：算好目标 → MOV ER6,ER0（@22414，吃 8 字节填充）→ jmp-er6（@21D38，吃 2）
+                import os as _os
+                if _os.environ.get("CROP_A7DBG"):
+                    print("A7DBG: if@链偏移 0x%02X, Then(=此处之后) = 0x%02X"
+                          % (len(cb.buf), len(cb.buf) + (4+2+4+2+4+4+4+8+4+2)))
+                gslot(pick(pop_gad["ER4"], low00)); gvalue("$%s - 2" % tn)
+                gslot(pick(pop_gad["ER2"], low00)); gvalue("$%s - $%s" % (en, tn))
+                if rt_push is not None:
+                    gslot(rt_push.addr)
+                gslot(a7["table"])
+                gslot(0x22414); graw(b"\x00" * 8)         # ER6 = ER0
+                gslot(0x21D38); graw(b"\x00" * 2)         # MOV SP,ER6 ; POP ER8 ; POP PC
+                nbytes = 4 + 2 + 4 + 2 + 4 + 4 + 4 + 8 + 4 + 2
+                stats["jump"] += 1
                 stats["blocks"] += 1
-                decisions.append(Decision(ins.addr, 0, "rt_fix",
-                                          "rt-fix @%05X" % rt_push.addr, 4, rt_push.addr))
-            dsl.append("// %04X: 调用 ROM 例程 %s @%05X（%d 条指令）"
-                       % (ins.addr, hit.name, hit.entry, hit.ninsn))
-            gslot(hit.entry)
-            stats["lib"] += 1
-            stats["blocks"] += 1
-            decisions.append(Decision(ins.addr, len(hit.code), "routine",
-                                      "rom:%s" % hit.name, 4, hit.entry))
-            i += hit.ninsn
+                decisions.append(Decision(ins.addr, 2, "jump", "if 条件跳转 #%d" % n, nbytes, a7["pivot"]))
+                cb.anchor(tn, opts.pivot_side)
+                dsl.append("<%s%s>" % ("-" if opts.pivot_side == LEFT else "", tn))
+                i += 1
+                while i < len(insns) and insns[i].addr < ins.addr + 2:
+                    i += 1
+                continue
+        if _a7k == "else":
+            if if_stack:
+                _top = if_stack[-1]
+                cb.anchor("E%d" % _top, opts.pivot_side)
+                dsl.append("<%sE%d>" % ("-" if opts.pivot_side == LEFT else "", _top))
+            i += 1
+            while i < len(insns) and insns[i].addr < ins.addr + 2:
+                i += 1
             continue
-
+        if getattr(opts, "a7_markers", {}).get(ins.addr) == "pad2":
+            graw(b"\x00" * 2)
+            i += 1
+            while i < len(insns) and insns[i].addr < ins.addr + 2:
+                i += 1
+            continue
+        if getattr(opts, "a7_markers", {}).get(ins.addr) == "pad8":
+            graw(b"\x00" * 8)                  # 例程内部 POP ER8 吃掉的 8 字节
+            i += 1
+            while i < len(insns) and insns[i].addr < ins.addr + 2:
+                i += 1
+            continue
+        if getattr(opts, "a7_markers", {}).get(ins.addr) == "pad4":
+            graw(b"\x00" * 4)                  # 例程内部 POP XR8 吃掉的 4 字节
+            i += 1
+            while i < len(insns) and insns[i].addr < ins.addr + 2:
+                i += 1
+            continue
+        if _a7k == "end":
+            if if_stack:
+                if_stack.pop()                     # 这一层 if 结束
+            i += 1
+            while i < len(insns) and insns[i].addr < ins.addr + 2:
+                i += 1
+            continue
+        # ---------------- 裸绝对跳转（冻结/跳回 OS）：DE AD <lo> <hi> <csr>（20 位目标）----
+        if ins.addr in marker_offsets and len(code) >= ins.addr + 6:
+            tgt = (code[ins.addr + 2] | (code[ins.addr + 3] << 8)
+                   | ((code[ins.addr + 4] & 0xF) << 16))
+            gslot(tgt)
+            dsl.append("#g%05X" % tgt)
+            decisions.append(Decision(ins.addr, 6, "jump", "裸跳转 → %05X" % tgt, 4, tgt))
+            stats["l3"] += 1
+            stats["blocks"] += 1
+            i += 1
+            while i < len(insns) and insns[i].addr < ins.addr + 6:
+                i += 1
+            continue
         # ---------------- 内联数据载体（字符串骑链）：整块吃字节、不写内存 ----------------
-        cm = getattr(db, "carrier_marker", None)
-        if cm and code.startswith(cm[0], ins.addr) and len(code) >= ins.addr + len(cm[0]) + cm[1]:
+        cm = getattr(opts, "carrier", None) or getattr(db, "carrier_marker", None)
+
+        if cm and ins.addr in carrier_offsets and len(code) >= ins.addr + len(cm[0]) + cm[1]:
             payload = bytes(code[ins.addr + len(cm[0]):ins.addr + len(cm[0]) + cm[1]])
-            caddr = sorted(a for a, g in db.by_addr.items()
-                           if g.inline_safe and b"".join(i.raw for i in db.rebuild(a).insns[:-1]) == cm[0]
-                           and g.data_bytes == cm[1])
+            # ★直接用它已知的地址（cm 可带第三项 = 载体地址）；反查只是兜底
+            caddr = [cm[2]] if len(cm) > 2 else sorted(
+                a for a, g in db.by_addr.items()
+                if g.inline_safe and b"".join(i.raw for i in db.rebuild(a).insns[:-1]) == cm[0]
+                and g.data_bytes == cm[1])
             if caddr:
                 gslot(caddr[0])
-                name = "P%04X" % len(cb.buf)
+                name = "S%d" % len(carrier_addrs)      # ★按序号命名：哨兵 0x8000|k ↔ $Sk
                 carrier_addrs.append(name)
                 last_anchor[0] = name
                 cb.anchor(name, opts.pivot_side)
                 dsl.append("<%s%s>" % ("-" if opts.pivot_side == LEFT else "", last_anchor[0]))
                 dsl.append("// %04X: 内联数据载体（%d 字节）→ 记为 %s"
-                           % (ins.addr, cm[1], last_anchor[0]))
+                           % (ins.addr, cm[1], name))
                 graw(payload)
                 stats["l1"] += 1
                 stats["blocks"] += 1
@@ -275,6 +384,7 @@ def translate(db: GadgetDB, code: bytes, opts: Optional[Options] = None) -> Resu
                 while i < len(insns) and insns[i].addr < ins.addr + len(cm[0]) + cm[1]:
                     i += 1
                 continue
+
         # 约定：`.bin` 中 ``POP <reg>`` 之后紧跟该指令要弹走的 ``sp_delta`` 个字节，
         # 由解释器原样搬进 ROP 链（这正是"任意常量"的来源）。
         if ins.cls == "pop_data":
@@ -289,8 +399,9 @@ def translate(db: GadgetDB, code: bytes, opts: Optional[Options] = None) -> Resu
             end = ins.addr + ins.size + nbytes
             payload = bytes(code[ins.addr + ins.size:end])
             sent = payload[0] | (payload[1] << 8) if len(payload) >= 2 else -1
-            if (sent & 0xFF00) == 0x8000 and (sent & 0xFF) < len(carrier_addrs):
-                name = carrier_addrs[sent & 0xFF]
+            if (sent & 0xFF00) == 0x8000:
+                _k = sent & 0xFF
+                name = carrier_addrs[_k] if _k < len(carrier_addrs) else "S%d" % _k
                 dsl.append("// %04X: %s ← 哨兵 → 骑链字符串 $%s" % (ins.addr, ins.text, name))
                 gslot(pick(addrs, low00))
                 gvalue("$%s" % name)
@@ -321,16 +432,92 @@ def translate(db: GadgetDB, code: bytes, opts: Optional[Options] = None) -> Resu
                 i += 1
             continue
 
+        if ins.addr in marker_offsets and len(code) >= ins.addr + 6:
+            _t = (code[ins.addr + 2] | (code[ins.addr + 3] << 8)
+                  | ((code[ins.addr + 4] & 0xF) << 16))
+            gslot(_t)
+            dsl.append("#g%05X" % _t)
+            decisions.append(Decision(ins.addr, 5, "jump", "裸跳转 → %05X" % _t, 4, _t))
+            stats["l3"] += 1
+            stats["blocks"] += 1
+            i += 1
+            while i < len(insns) and insns[i].addr < ins.addr + 6:
+                i += 1
+            continue
+        rj = getattr(opts, "raw_jumps", {}).get(ins.addr)
+        if rj is not None:                     # 裸跳转：直接发一个 20 位链槽
+            gslot(rj)
+            dsl.append("#g%05X" % rj)
+            decisions.append(Decision(ins.addr, ins.size, "jump", "裸跳转 → %05X" % rj, 4, rj))
+            stats["l3"] += 1
+            stats["blocks"] += 1
+            i += 1
+            while i < len(insns) and insns[i].addr < ins.addr + ins.size:
+                i += 1
+            continue
+        if ins.addr in labels:
+            name = labels[ins.addr]
+            cb.anchor(name, opts.pivot_side)
+            dsl.append("<%s%s>" % ("-" if opts.pivot_side == LEFT else "", name))
+            stats["anchors"] += 1
+            decisions.append(Decision(ins.addr, 0, "anchor", name))
+
+        # ---------------- ROM 例程调用（A1）---------------------------------
+        # `.bin` 里出现"某个 ROM 例程从入口到结尾的整段字节" → 发一个链槽跳过去。
+        # 以 ``RT`` 结尾的例程还要先发一个 rt-fix 槽（把"回来后继续吃链"压进硬件返回栈）。
+        hit = None
+        _nxt_lbl = min([o for o in labels if o > ins.addr], default=None)
+        for r in routs:
+            if code.startswith(r.code, ins.addr):
+                # ★不许把"程序内部跳转目标"吞进例程里（否则那个锚点永远不会生成）
+                if _nxt_lbl is not None and _nxt_lbl < ins.addr + len(r.code):
+                    continue
+                hit = r
+                break
+        if hit is not None:
+            if hit.needs_push and rt_push is None:
+                stats["unsupported"] += 1
+                decisions.append(Decision(ins.addr, len(hit.code), "unsupported",
+                                          "例程 %s（RT 结尾）缺少 rt-fix 原语" % hit.name))
+                i += hit.ninsn
+                continue
+            if hit.needs_push:
+                dsl.append("// %04X: 例程 %s @%05X 以 RT 结尾 → 先 rt-fix @%05X"
+                           % (ins.addr, hit.name, hit.entry, rt_push.addr))
+                gslot(rt_push.addr)
+                stats["lib"] += 1
+                stats["blocks"] += 1
+                decisions.append(Decision(ins.addr, 0, "rt_fix",
+                                          "rt-fix @%05X" % rt_push.addr, 4, rt_push.addr))
+            dsl.append("// %04X: 调用 ROM 例程 %s @%05X（%d 条指令）"
+                       % (ins.addr, hit.name, hit.entry, hit.ninsn))
+            gslot(hit.entry)
+            stats["lib"] += 1
+            stats["blocks"] += 1
+            decisions.append(Decision(ins.addr, len(hit.code), "routine",
+                                      "rom:%s" % hit.name, 4, hit.entry))
+            i += hit.ninsn
+            continue
+
+
+
         # ---------------- L3：无条件跳转 ----------------
         if ins.cls == "jump":
             t = _branch_target(ins)
             if (t is not None and 0 <= t < len(code) and t in by_off
                     and labels.get(t) and jump_pair is not None):
                 reg, pop_addr, piv = jump_pair
-                dsl.append("// %04X: %s → %s" % (ins.addr, ins.text, labels[t]))
-                gslot(pop_addr)
-                gvalue("$%s - %d" % (labels[t], piv.skip))
-                gslot(piv.addr)
+                dsl.append("// %04X: %s → %s（ER6 枢轴）" % (ins.addr, ins.text, labels[t]))
+                if "ER6" in pop_gad and 0x21D38 in db.by_addr:
+                    # ★统一用 ER6 枢轴：不依赖当前 SP（A7 也是这么跳的）
+                    gslot(pick(pop_gad["ER6"], low00))
+                    gvalue("$%s - 2" % labels[t])
+                    gslot(0x21D38)
+                    graw(b"\x00" * 2)
+                else:
+                    gslot(pop_addr)
+                    gvalue("$%s - %d" % (labels[t], piv.skip))
+                    gslot(piv.addr)
                 stats["jump"] += 1
                 decisions.append(Decision(ins.addr, ins.size, "jump",
                                           "%s → %s" % (ins.text, labels[t]), 10, pop_addr))
@@ -361,6 +548,9 @@ def translate(db: GadgetDB, code: bytes, opts: Optional[Options] = None) -> Resu
             if not all(_is_normal(x) or x.cls == "pop_data" for x in blk):
                 break
             end = blk[-1].addr + blk[-1].size
+            # ★块不许跨过"程序内部跳转目标"（否则那个锚点永远不会生成 ⇒ $Lxxxx 未定义）
+            if any(ins.addr < o < end for o in labels):
+                break
             cand = bytes(code[ins.addr:end])
             addrs = db.lookup(cand)
             if addrs:

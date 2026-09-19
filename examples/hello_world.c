@@ -22,7 +22,6 @@ void main(void) {
     rclear();                            /* 清屏幕缓冲区 */
     rprint(FONT_NORMAL, 20, "hello world!");   /* 正常字体（0x0E）：11px/字，字母按二级表 */
     rrefresh();                          /* 刷到显存 */
-    while (1) {
-    }
+    rhalt();                             /* 冻结（跳到 ROM 之外）：画面留住、不断电 */
 }
 

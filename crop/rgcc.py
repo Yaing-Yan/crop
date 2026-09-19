@@ -96,6 +96,8 @@ class Backend:
     #: 空操作间隔（``MOV Rn, Rn``，无副作用、以 POP PC 结尾）：用来把相邻的搬运动作隔开
     noop_ins: bytes = b""
     blk_pad: int = 0                  # 块写 gadget 尾巴里额外吃掉的链字节数
+    #: 寄存器搬移槽（变量→ER2 用）：名字 → (指令, "MOV A, B" 的指令字节)
+    reg_moves: Dict[str, bytes] = field(default_factory=dict)
     #: 内联数据载体：链上"只吃字节"的 gadget（字符串骑链用）
     carrier_addr: int = 0
     carrier_ins: bytes = b""
@@ -210,6 +212,12 @@ class Backend:
             got = self._single("POP %s" % reg)
             if got:
                 self.pop_gad[reg] = (got[0], got[1])
+
+        # ---- 寄存器搬移槽（给"变量 → ER2"用：L ER4,[BP] → MOV ER0,ER4 → MOV ER2,ER0）----
+        for txt in ("MOV ER0, ER4", "MOV ER2, ER0", "MOV ER0, ER2", "MOV ER4, ER0"):
+            got = self._single(txt)
+            if got:
+                self.reg_moves[txt] = got[1]
 
         # ---- 内联数据载体（字符串骑链）：纯吃链字节的 gadget ----
         from .libabi import find_carrier
@@ -338,11 +346,13 @@ class MemRef:
     目前恒为**常量地址**；A4 会把 ``kind='var'`` 用起来（地址存在某个变量里）。
     """
 
-    kind: str = "const"                 # 'const'（地址已知）| 'ptrparam'（指向编译期已知地址的形参）
+    kind: str = "const"                 # 'const' | 'ptrparam' | 'runtime'（A4：基址+变量下标）
     value: int = 0                      # const：绝对地址
-    var: str = ""                       # ptrparam：形参名
+    var: str = ""                       # ptrparam：形参名；runtime：下标变量名
     offset: int = 0
     note: str = ""
+    arr_base: int = 0                   # runtime：数组基址
+    elem_size: int = 1                  # runtime：元素大小
 
     def label(self) -> str:
         if self.kind == "const":
@@ -359,6 +369,10 @@ class Stmt:
     body: List["Stmt"] = field(default_factory=list)
     line: int = 0
     name: str = ""                      # kind == 'call'
+    a: str = ""                         # kind == 'ifgt'：左操作数变量名
+    cval: int = -1                      # kind == 'ifgt'/'whilegt'：右操作数是常量时的值
+    b: str = ""                         # kind == 'ifgt'：右操作数变量名
+    alt: List["Stmt"] = field(default_factory=list)   # kind == 'ifgt'：else 分支
     args: List[Tuple[str, object]] = field(default_factory=list)
 
 
@@ -386,6 +400,10 @@ class CompileUnit:
     funcs: Dict[str, Func] = field(default_factory=dict)
     structs: Dict[str, Dict[str, int]] = field(default_factory=dict)
     initials: Dict[int, bytes] = field(default_factory=dict)   # 静态初值（程序开头写入）
+    #: 裸跳转表：.bin 偏移 → 20 位目标地址（解释器在该处直接发链槽，不走指令流）
+    raw_jumps: Dict[int, int] = field(default_factory=dict)
+    #: A7 条件跳转标记：.bin 偏移 → 种类（if/else/end）
+    a7_markers: Dict[int, str] = field(default_factory=dict)
 
 
 _TOKEN = re.compile(r"""
@@ -423,6 +441,8 @@ class Parser:
     只要所有下标/字段偏移都是常量，地址在编译期就能算出来 —— 这正是本 ROM
     能做的事（运行时算术要等 A4/A7 的字节传送与条件分支）。
     """
+    #: 裸跳转表：.bin 偏移 → 20 位目标地址（解释器在该处直接发链槽，不走指令流）
+    raw_jumps: Dict[int, int] = field(default_factory=dict)
 
     def __init__(self, src: str, data_base: int):
         self.toks = _tokens(src)
@@ -801,8 +821,45 @@ class Parser:
     def parse_control(self, text: str, line: int) -> Stmt:
         if text == "for":
             return self.parse_for(line)
+        if text == "if":                             # A7：「变量 > 变量/常量」
+            self.next()
+            self.expect("(")
+            a = self.expect_kind("id")[1]
+            op = self.next()[1]
+            if op != ">":
+                raise RgccError("第 %d 行：目前 if 只支持 a > b / a > 常量" % line)
+            if self.peek()[0] == "num":
+                cv = int(self.next()[1], 0)
+                self.expect(")")
+                body = self.parse_block()
+                alt: List[Stmt] = []
+                if self.peek()[1] == "else":
+                    self.next()
+                    alt = self.parse_block()
+                return Stmt(kind="ifgt", a=a, cval=cv, body=body, alt=alt, line=line)
+            b = self.expect_kind("id")[1]
+            self.expect(")")
+            body = self.parse_block()
+            alt: List[Stmt] = []
+            if self.peek()[1] == "else":
+                self.next()
+                alt = self.parse_block()
+            return Stmt(kind="ifgt", a=a, b=b, body=body, alt=alt, line=line)
         if text != "while":
             raise RgccError("第 %d 行：v0 只支持 while(1)（if/%s 需要条件分支，见 A7）" % (line, text))
+        if (text == "while" and self.look(1)[1] == "(" and self.look(2)[0] == "id"
+                and self.look(3)[1] == ">"):          # A7：while (a > b) / while (a > 0)
+            self.next()
+            self.expect("(")
+            a = self.expect_kind("id")[1]
+            self.next()                                  # '>'
+            if self.peek()[0] == "num":
+                cv = int(self.next()[1], 0)
+                self.expect(")")
+                return Stmt(kind="whilegt", a=a, cval=cv, body=self.parse_block(), line=line)
+            b = self.expect_kind("id")[1]
+            self.expect(")")
+            return Stmt(kind="whilegt", a=a, b=b, body=self.parse_block(), line=line)
         self.next()
         self.expect("(")
         if self.peek()[0] != "num" or int(self.next()[1], 0) != 1:
@@ -903,7 +960,19 @@ class Parser:
                 if cur.kind != "array":
                     raise RgccError("第 %d 行：%s 不是数组" % (line, ref.note))
                 self.next()
-                idx = self.const_expr("数组下标")
+                # 先当常量算（for 展开时循环变量已被绑定为常量）；算不动再按 A4 运行时下标
+                _save = self.i                      # const_expr 失败时要把词法位置退回来
+                try:
+                    idx = self.const_expr("数组下标")
+                except RgccError:
+                    self.i = _save
+                    ivar = self.expect_kind("id")[1]
+                    self.expect("]")
+                    elem_size = self.sizeof(cur.elem)
+                    ref = MemRef(kind="runtime", arr_base=cur.addr, elem_size=elem_size,
+                                 var=ivar, note="%s[%s]" % (cur.name, ivar))
+                    cur = Sym(name=ref.note, addr=0, kind="byte", size=elem_size, elem=cur.elem)
+                    continue
                 self.expect("]")
                 if not 0 <= idx < cur.count:
                     raise RgccError("第 %d 行：下标 %d 越界（%s 长 %d）" % (line, idx, cur.name, cur.count))
@@ -1122,6 +1191,8 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
     label_off: Dict[int, int] = {}
     label_name: Dict[int, str] = {}
     fixups: List[Tuple[int, int]] = []
+    label_chain: Dict[int, int] = {}
+    pad_total = [0]        # pad 标记在链上会展开（2→4 / 2→8）：标签偏移必须补这个增量
     node = [0]
     inline_stack: List[str] = []
     ptr_stack: List[Dict[str, int]] = []      # 指针形参 → 编译期已知地址（内联时绑定）
@@ -1139,8 +1210,10 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
         return node[0]
 
     def place(lid: int) -> None:
-        label_off[lid] = len(code)
-        listing.append("      %-22s // = %04X" % (label_name[lid] + ":", len(code)))
+        label_off[lid] = len(code)                     # .bin 偏移：解释器靠它打锚点
+        label_chain[lid] = len(code) + pad_total[0]    # 链偏移：跳转目标要用这个
+        listing.append("      %-22s // = %04X (链 %04X)"
+                       % (label_name[lid] + ":", len(code), label_chain[lid]))
 
     def jump(lid: int, text: str) -> None:
         at2 = emit(bytes([0x00, 0xF0, 0x00, 0x00]), text)
@@ -1187,7 +1260,19 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
     def idx_fits(idx: int) -> bool:
         return len(parser.strings[idx]) + 1 <= backend.carrier_len
 
+    raw_jumps: Dict[int, int] = {}
+    a7_markers: Dict[int, str] = {}
+    verbatim: List[bytes] = []
     pending_carriers: List[int] = []
+    # A7 用：一个恒为 0 的 1 字节变量（把 16 位寄存器的高字节清零）
+    zero_addr = parser.alloc(1)
+    scratch_addr = parser.alloc(8, 2)          # A4：把寄存器 R0..R7 落到这里的临时区
+    tmp16_addr = parser.alloc(2, 2)            # 16 位地址临时单元
+    parser.initials[zero_addr] = b"\x00"
+    if lib is not None:
+        lib.zero_addr = zero_addr
+        lib.scratch_addr = scratch_addr
+        lib.tmp16_addr = tmp16_addr
 
     def emit_carriers() -> None:
         """把"骑链字符串"统一放在**程序末尾**：ROM 例程的栈帧只占 SP 以下的已走链段，
@@ -1231,6 +1316,23 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
 
     def gen(stmts: List[Stmt], scope: Dict[str, Sym], cur: Func,
             end_label: Optional[int]) -> None:
+        from .libabi import Param as _PR      # 本函数内多处用到
+
+        def _emit_padded_routine(nm, note, pad):
+            """发一条"内部有 POP 的例程"：例程字节 + 链填充标记（pad2/pad4/pad8）。"""
+            rb = lib.routine(nm).code
+            verbatim.append(rb)
+            emit(rb, note)
+            if pad:
+                a7_markers[len(code)] = "pad%d" % pad
+                emit(bytes([0xDE, {2: 0xB4, 4: 0xB2, 8: 0xB3}[pad]]),
+                     "填充 %d 字节（例程内部 POP）" % pad)
+                pad_total[0] += {2: 0, 4: 2, 8: 6}[pad]   # 展开后比标记多这么多字节
+
+        def _vaddr_of(nm):
+            sym = scope.get(nm)
+            return sym.addr if hasattr(sym, "addr") else (sym or 0)
+
         i = 0
         while i < len(stmts):
             st = stmts[i]
@@ -1290,9 +1392,134 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
                 if lib is None:
                     raise RgccError("第 %d 行：调用了 %s，但编译时没给库表"
                                     "（tools/rgcc --labels labels.conf）" % (st.line, st.name))
-                if st.dst is not None:
+                _fc = lib.funcs.get(st.name)
+                if st.dst is not None and not getattr(_fc, "returns", False):
                     raise RgccError("第 %d 行：库函数 %s 没有返回值" % (st.line, st.name))
                 try:
+                    # RMUL：dst = src * K（K 是编译期常量）—— 用 er0-table 例程
+                    if st.name == "rmul" and st.args and st.dst is not None:
+                        from .libabi import Param as _PM
+                        _mk, _mv = st.args[0]
+                        _ma = _mv if _mk == "var" else _vaddr_of(_mv)
+                        _K = int(st.args[1][1]) if len(st.args) > 1 else 1
+                        emit(lib._var("ER0", _ma), "R0 = %s" % st.args[0][1])
+                        emit(lib.marshal((_PM("s", "ER2", "u16"),), [("const", _K & 0xFF)]),
+                             "R2 = %d" % _K)
+                        emit(lib.marshal((_PM("b", "ER4", "u16"),), [("const", 0)]), "ER4 = 0")
+                        verbatim.append(lib.routine("rt_er0_table").code)
+                        emit(lib.routine("rt_er0_table").code, "ER0 = R0 * %d" % _K)
+                        _s2 = lib.scratch_addr
+                        emit(backend.blk_base + bytes([_s2 & 0xFF, (_s2 >> 8) & 0xFF])
+                             + backend.blk_body, "R0..R7 → 临时区 %04X" % _s2)
+                        _md = addr(st.dst, st.line)
+                        emit(backend.copy_var(_md, _s2), "%s = %s * %d（经临时区）"
+                             % (st.dst.note, st.args[0][1], _K))
+                        i += 1
+                        continue
+                    # RPLOT：屏幕缓冲区画图两颗助手（16 位地址 + 写字节）
+                    if st.name == "rplotcol" and len(st.args) >= 2:
+                        # 画一整根柱子：地址只算一次，然后逐行 +24（省掉每行的地址链）
+                        from .libabi import Param as _PC2
+                        _ok, _ov = st.args[0]          # off（字节列，通常是变量 i）
+                        _hk, _hv = st.args[1]          # h（高度）
+                        _oa = [("var", _ov) if _ok == "var" else ("const", _ov)]
+                        _ha = [("var", _hv) if _hk == "var" else ("const", _hv)]
+                        _t = lib.tmp16_addr
+                        off4, raw4 = lib.backend.var_load["ER4"]
+                        # 列首字节地址 = 0xDDD4 + off（用 mem-add，比 er0-table 少 4 个槽）
+                        emit(lib.marshal((_PC2("a", "ER8", "u16"),), [("const", _t)]), "ER8 = &tmp16")
+                        emit(lib.marshal((_PC2("v", "ER2", "u16"),), [("const", 0xE3BC)]),
+                             "ER2 = 0xDDD4 + 24*63（屏幕最后一行）")
+                        _emit_padded_routine("rt_st_er2_er8", "tmp16 = 底部起画", 4)
+                        emit(lib.marshal((_PC2("a", "ER8", "u16"),), [("const", _t)]), "ER8 = &tmp16")
+                        emit(lib.marshal((_PC2("o", "ER2", "u16"),), _oa), "ER2 = off")
+                        _emit_padded_routine("rt_mem_add", "tmp16 += off（列地址）", 4)
+                        # 内部行循环：y = h; while (y > 0) { rdec(y); 写一行(0xFF) + tmp16 += 24 }
+                        _yy = scope.get("y") or parser.lookup("y", st.line)
+                        _ya2 = _yy.addr if hasattr(_yy, "addr") else _yy
+                        emit(lib.marshal((_PC2("p", "R0", "u8"),), _ha), "R0 = h")
+                        emit(backend.blk_base + bytes([_ya2 & 0xFF, (_ya2 >> 8) & 0xFF])
+                             + backend.blk_body, "y = h（块写 R0..R7）")
+                        gen([Stmt(kind="whilegt", a="y", cval=0, body=[
+                            Stmt(kind="call", name="rdec", args=[("var", _ya2)], line=st.line),
+                            Stmt(kind="call", name="rplotnext", args=[], line=st.line),
+                        ], line=st.line)], scope, cur, end_label)
+                        i += 1
+                        continue
+                    if st.name == "rplotnext":
+                        from .libabi import Param as _PN
+                        _t = lib.tmp16_addr
+                        off4, raw4 = lib.backend.var_load["ER4"]
+                        # ★纯 POP-PC 取列地址（mem-add 变体 ⇒ ER10 旧值 ⇒ MOV ER2,ER10）
+                        emit(lib._read16_er2(_t), "ER2 = 列地址（纯 POP-PC）")
+                        emit(lib.marshal((_PN("p", "R0", "u8"),), [("const", 255)]), "R0 = 0xFF")
+                        verbatim.append(lib.rt_store())
+                        emit(lib.rt_store(), "写 0xFF（一行 8 像素）")
+                        # 列地址 += 24（下一行）
+                        emit(lib.marshal((_PN("a", "ER8", "u16"),), [("const", _t)]), "ER8 = &tmp16")
+                        emit(lib.marshal((_PN("o", "ER2", "u16"),), [("const", 0xFFE8)]), "ER2 = -24")
+                        _emit_padded_routine("rt_mem_add", "tmp16 -= 24（往上长一行）", 4)
+                        i += 1
+                        continue
+                    # RCHART：画图助手（寄存器装载都用现成槽）
+                    if st.name == "r_dim":
+                        emit(backend.write_byte_imm(0xD138, 0x03), "r_dim：0xD138 = 3")
+                        i += 1
+                        continue
+                    if st.name == "r_xy" and len(st.args) >= 2:
+                        _ak, _xv = st.args[0]
+                        _ax = _xv if _ak == "var" else _vaddr_of(_xv)
+                        emit(lib._var("ER0", _ax), "R0 = x, R1 = 0（零变量）")
+                        i += 1
+                        continue
+                    if st.name == "r_set2":
+                        _rb = lib.routine("r_set2").code
+                        verbatim.append(_rb); emit(_rb, "R2 = 2")
+                        i += 1
+                        continue
+                    if st.name == "r_set_h" and st.args:
+                        _ak, _hv = st.args[0]
+                        _ha = _hv if _ak == "var" else _vaddr_of(_hv)
+                        emit(lib._var("R9", _ha), "R9 = h")
+                        emit(lib.routine("r_set_h").code, "R3 = R9")
+                        i += 1
+                        continue
+                    if st.name == "r_blockdraw":
+                        _rb = lib.routine("r_blockdraw").code
+                        verbatim.append(_rb); emit(_rb, "画反色框")
+                        # 经 rt-fix 进入（needs_lr）：LR 指向链上续接，不再需要 SP 补偿
+                        i += 1
+                        continue
+                    # RINC：rinc(v) / rdec(v) → mem-add（地址与增量都是编译期常量）
+                    if st.name in ("rinc", "rdec", "radd8") and st.args:
+                        _ak, _v = st.args[0]
+                        if _ak == "var":                       # 实参已经是地址
+                            _va = _v
+                        else:
+                            _sym = scope.get(_v)
+                            _va = _sym.addr if hasattr(_sym, "addr") else (_sym or 0)
+                        _delta = 1 if st.name == "rinc" else (0xFFFF if st.name == "rdec"
+                                                              else (st.args[1][1] if len(st.args) > 1 else 1))
+                        emit(lib.marshal(lib.funcs[st.name].params,
+                                         [("const", _va), ("const", _delta)]),
+                             "%s(%s)：地址 %04X、增量 %d" % (st.name, _v, _va,
+                                                            _delta if _delta < 0x8000 else _delta - 0x10000))
+                        verbatim.append(lib.routine(st.name).code)
+                        emit(lib.routine(st.name).code, "mem-add 例程")
+                        a7_markers[len(code)] = "pad4"
+                        emit(bytes([0xDE, 0xB2]), "填充：例程内部 POP XR8 吃 4 字节")
+                        i += 1
+                        continue
+                    _f = lib.funcs.get(st.name)
+                    if _f is not None and getattr(_f, "raw_jump", False):
+                        _a = lib.target_addr(st.name)
+                        # 5 字节自证明标记：DE AD <lo> <hi> <csr>（含完整 20 位目标）
+                        pad_total[0] += 2
+                        emit(bytes([0xDE, 0xAD, _a & 0xFF, (_a >> 8) & 0xFF,
+                                    (_a >> 16) & 0xF, 0x00]),      # 6 字节（偶数）⇒ 后续偏移保持对齐
+                             "%s → %05X（裸跳转标记）" % (st.name, _a))
+                        i += 1                      # ★gen 里是 while 循环，必须自己推进
+                        continue
                     body_bytes = lib.emit_call(st.name, resolve(st.args, st.line))
                 except RgccError:
                     raise
@@ -1301,6 +1528,70 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
                 r = lib.routine(st.name)
                 emit(body_bytes, "%s(...);   // 搬运参数 + 例程 @%05X（%d 条指令，%s 结尾）"
                      % (st.name, r.entry, r.ninsn, r.term))
+                if st.dst is not None:
+                    # 返回值在 R0（以及 R1..R7 的垃圾）⇒ 用块写族把寄存器堆写到目标变量
+                    _da = addr(st.dst, st.line)
+                    emit(backend.blk_base + bytes([_da & 0xFF, (_da >> 8) & 0xFF])
+                         + backend.blk_body,
+                         "%s = R0（库返回值，连带 R1..R7 一起写，布局需留 8 字节余量）" % st.dst.note)
+                i += 1
+                continue
+
+            # ---------------- while (a > b) { … }（A7 循环）----------------
+            if st.kind == "whilegt":
+                if lib is None:
+                    raise RgccError("第 %d 行：while 条件需要库表（--labels）" % st.line)
+                def _wv(nm):
+                    sym = scope.get(nm) or parser.lookup(nm, st.line)
+                    return sym.addr if hasattr(sym, "addr") else sym
+                lid_cond = new_label("whcond")
+                place(lid_cond)
+                _rhs_w = (("const", st.cval) if st.cval >= 0 else ("var", _wv(st.b)))
+                emit(lib.emit_call("rcmp_gt", [_rhs_w, ("var", _wv(st.a))]),
+                     "R0 = 1 ⟺ (%s ≤ %s)" % (st.a, st.b if st.cval < 0 else st.cval))
+                a7_markers[len(code)] = "if"
+                emit(bytes([0xDE, 0xAF]), "循环条件（行 %d）" % st.line)
+                gen(st.body, scope, cur, end_label)              # block1 = 循环体（cond=0 时进入）
+                jump(lid_cond, "B %s   // 回跳：再判条件" % label_name[lid_cond])
+                a7_markers[len(code)] = "else"
+                emit(bytes([0xDE, 0xB0]), "循环出口（cond=1 跳过循环体）")
+                a7_markers[len(code)] = "end"
+                emit(bytes([0xDE, 0xB1]), "while 结束")
+                i += 1
+                continue
+
+            # ---------------- if (a > b) { } else { }（A7）----------------
+            if st.kind == "ifgt":
+                if lib is None:
+                    raise RgccError("第 %d 行：if 需要库表（--labels）" % st.line)
+                from .libabi import Param as _P
+                def _vaddr(nm):
+                    sym = scope.get(nm) or parser.lookup(nm, st.line)
+                    return sym.addr if hasattr(sym, "addr") else sym
+                # ★cmp-gt 的真实语义：R0 = 1 ⟺ (ER0 ≤ ER2)（见 ROM 0B61E 反汇编）
+                #   所以：block1 = else（无 else 时 = 跳到末尾）、block2 = then
+                # 直接用已验证的 ABI：rcmp_gt(b, a) ⇒ R0 = 1 ⟺ (a ≤ b)
+                _rhs = (("const", st.cval) if st.cval >= 0 else ("var", _vaddr(st.b)))
+                _cmp_bytes = lib.emit_call("rcmp_gt", [_rhs, ("var", _vaddr(st.a))])
+                verbatim.append(_cmp_bytes)
+                emit(_cmp_bytes, "R0 = 1 ⟺ (%s ≤ %s)"
+                     % (st.a, st.b if st.cval < 0 else st.cval))
+                a7_markers[len(code)] = "if"
+                emit(bytes([0xDE, 0xAF]), "条件跳转（行 %d）" % st.line)
+                # cond = 0（a > b）→ block1 = then；cond = 1（a ≤ b）→ block2 = else（或跳到末尾）
+                gen(st.body, scope, cur, end_label)              # block1 = then
+                lid = None
+                if st.alt is None:
+                    lid = new_label("ifend")
+                    jump(lid, "B %s   // 无 else：a ≤ b 时跳过 then" % label_name[lid])
+                a7_markers[len(code)] = "else"
+                emit(bytes([0xDE, 0xB0]), "第二段起点（else）")
+                if st.alt:
+                    gen(st.alt, scope, cur, end_label)           # block2 = else
+                if lid is not None:
+                    place(lid)
+                a7_markers[len(code)] = "end"
+                emit(bytes([0xDE, 0xB1]), "if 结束")
                 i += 1
                 continue
 
@@ -1346,10 +1637,50 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
                     continue
 
             if st.kind == "assign":
+                if st.dst.kind == "runtime":                    # A4：v[i] = 常量
+                    from .libabi import Param as _PA
+                    emit(lib.rt_element(st.dst.arr_base, st.dst.elem_size,
+                                        _vaddr_of(st.dst.var)), "&%s → ER0" % st.dst.note)
+                    # 设备已验证的路线：ER0 = &v[i]（er0-table），再补一次 ER2 = ER0
+                    _e2 = lib.routine("er2_from_er0").code
+                    verbatim.append(_e2); emit(_e2, "ER2 = ER0（目标地址）")
+                    emit(lib.marshal((_PA("t", "R0", "u8"),), [("const", st.value)]),
+                         "R0 ← %d" % st.value)
+                    verbatim.append(lib.rt_store())
+                    emit(lib.rt_store(), "%s = %d（A4 写）" % (st.dst.note, st.value))
+                    i += 1
+                    continue
                 da = addr(st.dst, st.line)
                 emit(backend.write_byte_imm(da, st.value),
                      "%s = %d;            // [%04X] ← %02X" % (st.dst.note, st.value, da, st.value))
             elif st.kind == "copy":
+                from .libabi import Param as _PC
+                if st.src.kind == "runtime":                    # A4：x = v[i]
+                    emit(lib.rt_element(st.src.arr_base, st.src.elem_size,
+                                        _vaddr_of(st.src.var)), "&%s → ER0" % st.src.note)
+                    verbatim.append(lib.rt_load())
+                    emit(lib.rt_load(), "R0 ← %s（A4 读）" % st.src.note)
+                    _sx = lib.scratch_addr
+                    emit(backend.blk_base + bytes([_sx & 0xFF, (_sx >> 8) & 0xFF])
+                         + backend.blk_body, "R0..R7 → 临时区 %04X" % _sx)
+                    da = addr(st.dst, st.line)
+                    emit(backend.copy_var(da, _sx),
+                         "%s = %s;            // [%04X] ← [%04X]（经临时区）"
+                         % (st.dst.note, st.src.note, da, _sx))
+                    i += 1
+                    continue
+                if st.dst.kind == "runtime":                    # A4：v[i] = x
+                    emit(lib.rt_element(st.dst.arr_base, st.dst.elem_size,
+                                        _vaddr_of(st.dst.var)), "&%s → ER0" % st.dst.note)
+                    # 设备已验证的路线：ER0 = &v[i]（er0-table），再补一次 ER2 = ER0
+                    _e2 = lib.routine("er2_from_er0").code
+                    verbatim.append(_e2); emit(_e2, "ER2 = ER0（目标地址）")
+                    emit(lib.marshal((_PC("t", "R0", "u8"),), [("var", addr(st.src, st.line))]),
+                         "R0 ← %s" % st.src.note)
+                    verbatim.append(lib.rt_store())
+                    emit(lib.rt_store(), "%s = %s（A4 写）" % (st.dst.note, st.src.note))
+                    i += 1
+                    continue
                 da, sa = addr(st.dst, st.line), addr(st.src, st.line)
                 emit(backend.copy_var(da, sa),
                      "%s = %s;            // [%04X] ← [%04X]" % (st.dst.note, st.src.note, da, sa))
@@ -1370,7 +1701,7 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
 
     # 回填跳转（B 是 4 字节绝对地址：低字节在先）
     for at2, lid in fixups:
-        target = label_off[lid]
+        target = label_chain.get(lid, label_off[lid])
         if target < 0:                                   # pragma: no cover - 防御
             raise RgccError("内部错误：标签 %s 没有落地" % label_name[lid])
         code[at2 + 2] = target & 0xFF
@@ -1378,14 +1709,14 @@ def compile_source(src: str, backend: Backend, data_base: int = 0xD180,
 
     # ---- 核对：每条指令都必须有 gadget（否则"解释器覆盖 100%"不成立）
     routines = tuple(getattr(lib, "routines", {}).values()) if lib is not None else ()
-    verify_translatable(bytes(code), backend.db, routines=routines)
+    verify_translatable(bytes(code), backend.db, routines=routines, verbatim=verbatim)
 
     allvars: Dict[str, Sym] = {}
     for f in list(parser.funcs.values()) + []:
         for k, v in f.scope.items():
             allvars.setdefault(k, v)
     allvars.update(globals_)
-    return CompileUnit(source=src, vars=allvars, body=main_body, code=bytes(code),
+    return CompileUnit(a7_markers=a7_markers, source=src, vars=allvars, body=main_body, code=bytes(code),
                        listing=listing, data_base=data_base, strings=data,
                        protos=dict(parser.protos), funcs=dict(parser.funcs),
                        structs=dict(parser.structs), initials=dict(parser.initials))
@@ -1398,7 +1729,8 @@ def _label_offset(listing: Sequence[str], label: str) -> int:
     raise RgccError("内部错误：找不到标签 %s" % label)
 
 
-def verify_translatable(code: bytes, db: GadgetDB, routines: Sequence = ()) -> None:
+def verify_translatable(code: bytes, db: GadgetDB, routines: Sequence = (),
+                        verbatim: Sequence[bytes] = ()) -> None:
     """逐**块**核对：ROM 里存在"同字节 + 后面紧跟 POP PC"的 gadget。
 
     与解释器的 L1 完全同构：贪心取最长可匹配块；取数原语（POP）按其 ``sp_delta``
@@ -1411,6 +1743,16 @@ def verify_translatable(code: bytes, db: GadgetDB, routines: Sequence = ()) -> N
     carrier = getattr(db, "carrier_marker", b"")
     a = 0
     while a + 2 <= len(code):
+        _vb = next((b for b in verbatim if code.startswith(b, a)), None)
+        if _vb is not None:
+            a += len(_vb)                     # 编译器直接发射的例程/gadget 字节：整块跳过
+            continue
+        if code[a] == 0xDE and code[a + 1] in (0xAF, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4):
+            a += 2                                        # A7 条件跳转标记：整块跳过
+            continue
+        if code[a] == 0xDE and code[a + 1] == 0xAD and len(code) >= a + 5:
+            a += 6                                        # 裸跳转标记：整块跳过（6 字节，保持偶数对齐）
+            continue
         if carrier and code.startswith(carrier[0], a) and len(code) >= a + len(carrier[0]) + carrier[1]:
             a += len(carrier[0]) + carrier[1]          # 内联数据载体：整块跳过
             continue

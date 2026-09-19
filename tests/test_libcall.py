@@ -116,10 +116,13 @@ class TestRoutines(unittest.TestCase):
         self.assertIn(self.be.var_load["R1"][1], code)
         self.assertIn(self.be.base_pop, code)
 
-    def test_variable_to_er2_is_refused(self):
+    def test_variable_to_er2_goes_through_er0(self):
+        """变量 → ER2：先装 ER0（低字节=变量、高字节=零变量），再用例程搬到 ER2。"""
+        self.lib.zero_addr = 0xD7F0
         f = self.lib.func("rprint")
-        with self.assertRaises(Exception):
-            self.lib.marshal(f.params, [("const", 0x0E), ("const", 0), ("var", 0xD700)])
+        code = self.lib.marshal(f.params, [("const", 0x0E), ("const", 0), ("var", 0xD700)])
+        self.assertIn(self.be.var_load["R0"][1], code)          # L R0,[BP]
+        self.assertIn(self.lib.routine("er2_from_er0").code, code)
 
     def test_emit_call_reads_routine_bytes_from_rom(self):
         code = self.lib.emit_call("rclear", [])

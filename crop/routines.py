@@ -49,10 +49,17 @@ class Routine:
     code: bytes            # .bin 里应出现的字节（入口 → 结尾指令，含结尾指令）
     term: str              # 'pop_pc' | 'rt'
     ninsn: int
+    #: True 表示这条例程内部会 "返回 LR"（PUSH LR … POP PC）⇒ 必须像 RT 例程那样
+    #: **经 rt-fix 进入**（让 LR 指向链上续接位置），否则直跳进去会跳到垃圾地址。
+    needs_lr: bool = False
 
     @property
     def needs_push(self) -> bool:
-        return self.term == "rt"
+        return self.term == "rt" or self.needs_lr
+
+
+#: 内部"返回 LR"的例程（需要经 rt-fix 进入）——按标签名
+LR_ROUTINES = {"blk-draw", "render-bitmap"}
 
 
 @dataclass
@@ -137,6 +144,7 @@ def build_routines(rom: RomImage, table: LabelTable,
         except ValueError as e:
             warn.append("标签 %s：%s（跳过，不作为例程）" % (r.label.name, e))
             continue
-        out[r.label.name] = Routine(name=r.label.name, entry=r.addr, code=code,
+        out[r.label.name] = Routine(name=r.label.name, needs_lr=r.label.name in LR_ROUTINES,
+                                    entry=r.addr, code=code,
                                     term=term, ninsn=n)
     return out, warn

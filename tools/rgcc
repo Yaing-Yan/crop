@@ -41,8 +41,10 @@ def main() -> int:
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ap.add_argument("--labels", default=os.path.join(root, "labels.conf"),
                     help="标签表（库例程入口按签名逐 Ver 解析；默认仓库根的 labels.conf）")
+    ap.add_argument("--carrier", action="store_true",
+                    help="启用字符串骑链（实验特性，默认关闭：实测渲染异常）")
     ap.add_argument("--no-carrier", action="store_true",
-                    help="禁用字符串骑链，字符串改回写数据区（排查/兼容用）")
+                    help="（兼容保留；骑链现在本来就是默认关闭）")
     ap.add_argument("--no-lib", action="store_true",
                     help="不用库表（此时调用库函数会报错）")
     ap.add_argument("--max-insns", type=int, default=8)
@@ -54,7 +56,8 @@ def main() -> int:
     db = scan(rom, max_insns=args.max_insns)
     try:
         backend = Backend(db)
-        if args.no_carrier:
+        # ★骑链默认关闭：真机实测"字符串骑链"渲染异常（数据区路径才是上周验证过的）
+        if not args.carrier:
             backend.carrier_addr = backend.carrier_len = 0
             backend.carrier_ins = b""
     except RgccError as e:
@@ -111,9 +114,13 @@ def main() -> int:
         print("已写出 %s" % args.output)
 
     if args.rop or args.dsl:
-        lb = int(args.left_base, 16) if not args.left_base.lower().startswith("0x") \
-            else int(args.left_base, 16)
-        opts = Options(max_insns=args.max_insns, left_base=lb)
+        lb = int(args.left_base, 16)
+        opts = Options(max_insns=args.max_insns, left_base=lb,
+                       raw_jumps=getattr(cu, "raw_jumps", {}),
+                       a7_markers=getattr(cu, "a7_markers", {}),
+                       carrier=(backend.carrier_ins, backend.carrier_len,
+                                backend.carrier_addr)
+                               if backend.carrier_len else None)
         if lib is not None:
             opts.routines = tuple(lib.routines.values())
             opts.rt_push = lib.rt_push

@@ -50,6 +50,23 @@ void rprint_at(unsigned char x, unsigned char y, const unsigned char *text);
 /*: 常用居中：把 12 字左右的短句放在屏幕正中（y=20） */
 #define RPRINT_CENTER(text) rprint_at(30, 20, text)
 
+/*: 画一个反色矩形框：先调 r_xy(x, y)、r_set2()、r_set_h(h)，再调 r_blockdraw()。
+ *  （对应 ROM 例程 0x08B2A；需要先调 r_dim()） */
+void r_xy(unsigned char x, unsigned char y);
+void r_set2(void);
+void r_set_h(unsigned char h);
+void r_blockdraw(void);
+
+/*: 屏幕缓冲区画图：先 raddr24(y, off) 算出地址，再 rplot16(pat) 写一个字节。 */
+void rplotrow(unsigned char y, unsigned char off, unsigned char pat);
+void rplotcol(unsigned char off, unsigned char h);
+void rplotnext(void);   /* 画一行两像素 */
+void raddr24(unsigned char y, unsigned char off);
+void rplot16(unsigned char pat);
+
+/*: 画图模式准备：把 0xD138 设为 3（blockdraw 的前置条件） */
+void r_dim(void);
+
 /*: 把屏幕缓冲区刷新到显存（并提交给显示控制器） */
 void rrefresh(void);
 
